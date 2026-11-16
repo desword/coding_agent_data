@@ -10,12 +10,77 @@ def executable(path,body):
  path.parent.mkdir(parents=True,exist_ok=True); path.write_text(body,encoding='utf-8'); path.chmod(0o755)
 
 class Integration(unittest.TestCase):
- def test_gradle_reuses_previous_finished_same_app_cache(self):
+ def test_gradle_copies_old_downloads_into_independent_shared_cache(self):
   with tempfile.TemporaryDirectory() as tmp:
    base=pathlib.Path(tmp);cache=base/'cache';cache.mkdir();root=base/'android01-20261116-2';root.mkdir()
-   previous=base/'android01-20261116-1';previous.mkdir();(previous/'Gradle缓存').mkdir()
+   previous=base/'android01-20261116-1';previous.mkdir();old=previous/'Gradle缓存'
+   artifact=old/'caches/modules-2/files-2.1/group/artifact/1/hash/test.jar';artifact.parent.mkdir(parents=True);artifact.write_text('artifact')
+   metadata=old/'caches/modules-2/metadata-2.107/index.bin';metadata.parent.mkdir(parents=True);metadata.write_text('do not copy active index')
+   dist=old/'wrapper/dists/gradle-9/binhash';dist.mkdir(parents=True);(dist/'gradle.zip.ok').write_text('');(dist/'gradle.zip').write_text('zip');(dist/'gradle.zip.lck').write_text('lock')
    (previous/'实验状态.json').write_text(json.dumps({'app_commit':module.APP_REV,'finished_utc':'2026-11-16T00:00:00Z'}))
-   self.assertEqual(module.gradle_cache_home(root,cache),previous/'Gradle缓存')
+   result=module.gradle_cache_home(root,cache);self.assertEqual(result,cache/'Gradle缓存')
+   self.assertTrue(previous.exists());shutil.rmtree(previous)
+   self.assertEqual((result/'caches/modules-2/files-2.1/group/artifact/1/hash/test.jar').read_text(),'artifact')
+   self.assertTrue((result/'wrapper/dists/gradle-9/binhash/gradle.zip.ok').exists())
+   self.assertFalse((result/'wrapper/dists/gradle-9/binhash/gradle.zip.lck').exists())
+   self.assertFalse((result/'caches/modules-2/metadata-2.107').exists())
+   self.assertEqual(module.gradle_cache_home(root,cache),result)
+ def test_later_finished_legacy_run_is_migrated_on_next_start(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   base=pathlib.Path(tmp);cache=base/'cache';cache.mkdir();root=base/'android01-3';root.mkdir();old=base/'android01-1';old.mkdir()
+   artifact=old/'Gradle缓存/caches/modules-2/files-2.1/group/artifact/1/hash/a.jar';artifact.parent.mkdir(parents=True);artifact.write_text('later')
+   shared=module.gradle_cache_home(root,cache)
+   self.assertFalse((shared/'caches/modules-2/files-2.1/group/artifact/1/hash/a.jar').exists())
+   (old/'实验状态.json').write_text(json.dumps({'app_commit':module.APP_REV,'finished_utc':'later'}))
+   self.assertEqual(module.gradle_cache_home(root,cache),shared)
+   self.assertEqual((shared/'caches/modules-2/files-2.1/group/artifact/1/hash/a.jar').read_text(),'later')
+ def test_python_report_environment_is_reused_across_batches(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   cache=pathlib.Path(tmp);log=cache/'test.log';calls=[]
+   def fake_command(argv,**kwargs):
+    calls.append(argv)
+    if argv[1:3]==['-m','venv']: executable(pathlib.Path(argv[3])/'bin/python','#!/bin/sh\nexit 0\n')
+    return types.SimpleNamespace(returncode=0)
+   with mock.patch.object(module,'command',side_effect=fake_command),mock.patch.object(module,'python_env_valid',side_effect=lambda py:py.exists()):
+    first=module.prepare_python_env(cache,{},log);second=module.prepare_python_env(cache,{},log)
+   self.assertEqual(first,second);self.assertTrue(first.is_relative_to(cache));self.assertEqual(len(calls),2)
+ def test_codex_tool_migrates_and_survives_old_run_deletion(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   base=pathlib.Path(tmp);cache=base/'cache';cache.mkdir();root=base/'android01-2';root.mkdir();previous=base/'android01-1';previous.mkdir()
+   (previous/'实验状态.json').write_text(json.dumps({'app_commit':module.APP_REV,'finished_utc':'done'}))
+   executable(previous/'codex工具/node_modules/.bin/codex','#!/bin/sh\necho codex-cli-fake\n')
+   env={'PATH':'/usr/bin:/bin'}
+   with mock.patch.object(module,'command',side_effect=AssertionError('should migrate')):
+    result=module.ensure_codex(env,cache,base/'test.log',root)
+   shutil.rmtree(previous)
+   binary=pathlib.Path(result['PATH'].split(os.pathsep)[0])/'codex'
+   self.assertTrue(binary.is_file());self.assertTrue(binary.resolve().is_relative_to(cache))
+   self.assertEqual(subprocess.check_output([str(binary),'--version'],text=True).strip(),'codex-cli-fake')
+ def test_shared_cache_lock_serializes_installation(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   cache=pathlib.Path(tmp);held=threading.Event();release=threading.Event();acquired=threading.Event();errors=[]
+   def first():
+    try:
+     with module.cache_lock(cache,'example'):held.set();release.wait(3)
+    except BaseException as exc:errors.append(exc)
+   def second():
+    try:
+     with module.cache_lock(cache,'example'):acquired.set()
+    except BaseException as exc:errors.append(exc)
+   a=threading.Thread(target=first);b=threading.Thread(target=second);a.start();self.assertTrue(held.wait(2));b.start()
+   try:self.assertFalse(acquired.wait(.2))
+   finally:release.set();a.join(3);b.join(3)
+   self.assertTrue(acquired.is_set());self.assertFalse(errors)
+ def test_mobile_tool_migrates_and_survives_old_run_deletion(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   base=pathlib.Path(tmp);cache=base/'cache';cache.mkdir();root=base/'android01-2';root.mkdir();previous=base/'android01-1';previous.mkdir()
+   (previous/'实验状态.json').write_text(json.dumps({'app_commit':module.APP_REV,'finished_utc':'done'}))
+   old=previous/'设备工具';modules=old/'node_modules';package=modules/'@mobilenext/mobile-mcp';package.mkdir(parents=True);(package/'package.json').write_text(json.dumps({'version':'1.0.17'}));executable(package/'lib/index.js','#!/bin/sh\nexit 0\n')
+   native=modules/'@mobilenext/mobilecli-darwin-arm64/mobilecli-darwin-arm64';executable(native,'#!/bin/sh\nexit 0\n')
+   bins=modules/'.bin';bins.mkdir();(bins/'mcp-server-mobile').symlink_to('../@mobilenext/mobile-mcp/lib/index.js')
+   with mock.patch.object(module.subprocess,'run',return_value=types.SimpleNamespace(returncode=0,stdout='darwin-arm64\n')),mock.patch.object(module,'command',side_effect=AssertionError('should migrate')):
+    first=module.prepare_mobile_tool(root,cache,{},base/'test.log');shutil.rmtree(previous);second=module.prepare_mobile_tool(root,cache,{},base/'test.log')
+   self.assertEqual(first,second);self.assertTrue(first.is_file());self.assertTrue(first.resolve().is_relative_to(cache))
  def test_gradle_maven_tls_failure_switches_official_mirror(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=pathlib.Path(tmp);shared=root/'shared';shared.mkdir();log=root/'build.log';env={'GRADLE_USER_HOME':str(shared)};info={};calls=[]
@@ -304,6 +369,7 @@ if '--skip-git-repo-check' in sys.argv:
 assert '--model' in sys.argv and sys.argv[sys.argv.index('--model')+1]=='gpt-5.4'
 assert any('mcp_servers.mobile-mcp.command=' in arg for arg in sys.argv)
 assert 'sandbox_workspace_write.network_access=true' in sys.argv
+assert pathlib.Path(os.environ['ANDROID_EXPERIMENT_MCP_COMMAND']).resolve().is_relative_to(pathlib.Path(os.environ['HOME'])/'codex-agent-experiments/工具缓存')
 p=pathlib.Path(os.environ['CODEX_HOME'])/'sessions';p.mkdir(parents=True,exist_ok=True)
 def row(t,p):return {'timestamp':'2026-11-16T10:00:00Z','type':t,'payload':p}
 def write(path,rows):path.write_text(''.join(json.dumps(x,ensure_ascii=False)+'\\n' for x in rows),encoding='utf-8')
@@ -314,18 +380,26 @@ print(json.dumps({'type':'thread.started','thread_id':'root'}))
 print('2026-01-01T00:00:00.000Z codex_otel.agent_communication: communication_id="one" kind="message" state="send"',file=sys.stderr)
 print('2026-01-01T00:00:00.030Z codex_otel.agent_communication: communication_id="one" state="receive"',file=sys.stderr)
 ''')
-   original=module.command
+   original=module.command; installs=[]
    def wrapped(argv,**kwargs):
     if len(argv)>=3 and argv[1:3]==['-m','venv']:
-     pathlib.Path(argv[3]).symlink_to(pathlib.Path(sys.executable).parent.parent,target_is_directory=True); return
-    if len(argv)>=4 and argv[1:4]==['-m','pip','install']: return
+     installs.append('venv');pathlib.Path(argv[3]).symlink_to(pathlib.Path(sys.executable).parent.parent,target_is_directory=True); return
+    if len(argv)>=4 and argv[1:4]==['-m','pip','install']: installs.append('pip');return
     if argv[0]=='npm' and '@mobilenext/mobile-mcp@1.0.17' in argv:
-     dest=pathlib.Path(argv[argv.index('--prefix')+1])/'node_modules/.bin/mcp-server-mobile'; executable(dest,'#!/bin/sh\nexit 0\n'); return
+     installs.append('mcp');prefix=pathlib.Path(argv[argv.index('--prefix')+1]);modules=prefix/'node_modules';dest=modules/'.bin/mcp-server-mobile';executable(dest,'#!/bin/sh\nexit 0\n')
+     package=modules/'@mobilenext/mobile-mcp';package.mkdir(parents=True);(package/'package.json').write_text(json.dumps({'version':'1.0.17'}))
+     node=subprocess.run(['node','-p',"process.platform+'-'+process.arch"],env=kwargs['env'],capture_output=True,text=True);arch=node.stdout.strip().replace('-x64','-amd64');executable(modules/'@mobilenext'/('mobilecli-'+arch)/('mobilecli-'+arch),'#!/bin/sh\nexit 0\n');return
     return original(argv,**kwargs)
    env={'HOME':str(home),'ANDROID_HOME':str(sdk),'ANDROID_SDK_ROOT':str(sdk),'CODEX_HOME':str(base/'codexhome'),'PATH':str(bindir)+os.pathsep+os.environ['PATH']}
-   with mock.patch.dict(os.environ,env,clear=False),mock.patch.object(module,'command',side_effect=wrapped),mock.patch.object(module.os,'uname',return_value=type('U',(),{'machine':'x86_64'})()):
+   with mock.patch.dict(os.environ,env,clear=False),mock.patch.object(module,'command',side_effect=wrapped),mock.patch.object(module,'python_env_valid',side_effect=lambda p:p.is_file()),mock.patch.object(module.os,'uname',return_value=type('U',(),{'machine':'x86_64'})()):
     self.assertEqual(module.main(),0)
-   out=next((home/'codex-agent-experiments').glob('android01-*')); info=json.loads((out/'实验状态.json').read_text());
+    self.assertEqual(module.main(),0)
+   experiment_base=home/'codex-agent-experiments';runs=sorted(experiment_base.glob('android01-*'))
+   self.assertEqual(len(runs),2);self.assertEqual(installs.count('venv'),1);self.assertEqual(installs.count('pip'),1);self.assertEqual(installs.count('mcp'),1)
+   for run in runs:
+    self.assertTrue((run/'实验报告.html').is_file());self.assertFalse((run/'工具环境').exists());self.assertFalse((run/'设备工具').exists());self.assertFalse((run/'Gradle缓存').exists())
+   shutil.rmtree(runs[0]);self.assertTrue((experiment_base/'工具缓存/Gradle缓存').is_dir());self.assertTrue((runs[1]/'实验报告.html').is_file())
+   out=runs[1]; info=json.loads((out/'实验状态.json').read_text());
    self.assertEqual(info['model_selection'],'gpt-5.4')
    self.assertIn('formal_elapsed_seconds',info); self.assertNotIn('phases',info)
    self.assertIn('正式开发耗时',(out/'实验报告.html').read_text())

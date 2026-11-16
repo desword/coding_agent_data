@@ -8,7 +8,7 @@
 
 在 Mac 上下载完整仓库后，可以双击根目录的 [一键启动多Agent实验.command](一键启动多Agent实验.command)：它是案例 01 的快捷入口。**若只想下载一个文件，请下载上表中的案例脚本本身**；根目录快捷入口依赖仓库内的目标文件。
 
-脚本会自动准备缺少的 JDK、Node.js 和 Android SDK 组件；请按 [案例 01 的运行说明](android实验/01-NowInAndroid/README.md) 准备 Git、Python 和支持模拟器的机器，并在需要时按提示登录 Codex、处理 Android 许可协议。运行结束后查看 `~/codex-agent-experiments/android01-时间戳/实验报告.html`。
+脚本会自动准备缺少的 JDK、Node.js 和 Android SDK 组件；请按 [案例 01 的运行说明](android实验/01-NowInAndroid/README.md) 准备 Git、Python 和支持模拟器的机器，并在需要时按提示登录 Codex、处理 Android 许可协议。运行结束后查看 `~/codex-agent-experiments/android01-时间戳/实验报告.html`。 公共依赖保存在 `~/codex-agent-experiments/工具缓存/`，各次报告和应用副本保存在独立批次目录；清理旧批次前请先运行新版完成缓存迁移。
 
 后续增加新案例时，会在 `android实验/02-应用名/` 等新文件夹中提供该应用自己的脚本与说明，运行时使用它自己的实验结果目录，不覆盖已有案例。根目录快捷入口仍指向案例 01；选择运行哪个案例，只需双击对应案例的脚本，不需要在脚本中选择项目。[候选应用与优先级](android实验/候选应用与优先级.md) 列出了待准备的案例，目前它们尚未配置或测试。
 

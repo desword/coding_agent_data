@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone Android/Codex experiment. Run by double-click or python3."""
 from __future__ import annotations
-import base64, codecs, collections, contextlib, csv, datetime as dt, hashlib, html, json, math, os, pathlib, re, selectors, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request, webbrowser, xml.etree.ElementTree as ET, zipfile, zlib
+import base64, codecs, collections, contextlib, csv, datetime as dt, fcntl, hashlib, html, json, math, os, pathlib, re, selectors, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request, webbrowser, xml.etree.ElementTree as ET, zipfile, zlib
 
 APP_URL = 'https://github.com/android/nowinandroid.git'
 APP_REV = 'a49ed253d75e61a2b6ab80a8da677b57437b08eb'
@@ -195,6 +195,142 @@ def probe_result(path):
     except OSError: pass
     return terminal,errors
 
+@contextlib.contextmanager
+def cache_lock(cache,name,seconds=900):
+    locks=cache/'.锁';locks.mkdir(parents=True,exist_ok=True)
+    with (locks/(name+'.lock')).open('a+') as f:
+        start=time.monotonic(); next_notice=start+15
+        while True:
+            try: fcntl.flock(f.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB);break
+            except BlockingIOError:
+                now=time.monotonic()
+                if now-start>=seconds: raise SetupError(f'等待共享缓存 {name} 超时；请检查是否有另一批实验正在安装依赖。')
+                if now>=next_notice:
+                    print(f'[缓存] 另一批实验正在准备 {name}；已等待 {clock(now-start)}。',flush=True);next_notice=now+15
+                time.sleep(.5)
+        try: yield
+        finally: fcntl.flock(f.fileno(),fcntl.LOCK_UN)
+
+def ensure_codex(env,cache,log,root):
+    if shutil.which('codex',path=env.get('PATH')): return env
+    def usable(binary):
+        if not binary.is_file() or not os.access(binary,os.X_OK):return False
+        try:return subprocess.run([str(binary),'--version'],env=env,capture_output=True,text=True,timeout=30).returncode==0
+        except (OSError,subprocess.SubprocessError):return False
+    with cache_lock(cache,'codex'):
+        for name in ('codex新版','codex工具'):
+            binary=cache/name/'node_modules/.bin/codex'
+            if usable(binary):
+                env['PATH']=str(binary.parent)+os.pathsep+env.get('PATH','');return env
+        target=cache/'codex工具'
+        for previous in finished_runs(root):
+            source=previous/'codex工具'
+            try:
+                if not usable(source/'node_modules/.bin/codex') or not safe_mobile_links(source):continue
+                print('[缓存] 将已完成批次的 Codex 工具复制到公共缓存。',flush=True)
+                with tempfile.TemporaryDirectory(prefix='.codex-copy-',dir=cache) as tmp:
+                    stage=pathlib.Path(tmp)/'package'
+                    with heartbeat('正在迁移 Codex 工具'):
+                        shutil.copytree(source,stage,symlinks=True)
+                    binary=stage/'node_modules/.bin/codex'
+                    if not usable(binary):continue
+                    if target.exists() or target.is_symlink():target.rename(cache/(target.name+'-待检查-'+str(time.time_ns())))
+                    stage.rename(target)
+                print('[缓存] Codex 工具已迁至公共缓存。',flush=True)
+                env['PATH']=str(target/'node_modules/.bin')+os.pathsep+env.get('PATH','');return env
+            except (OSError,shutil.Error) as exc:
+                print('[缓存] 旧 Codex 工具暂时无法复制，将尝试其他批次或重新安装：',type(exc).__name__,flush=True)
+        print('[缓存] 安装共享 Codex CLI。',flush=True)
+        command(['npm','install','--prefix',str(target),'--no-audit','--no-fund','@openai/codex'],env=env,logfile=log,timeout=900)
+        binary=target/'node_modules/.bin/codex'
+        if not usable(binary): raise SetupError('Codex 安装后未找到可运行的执行文件。')
+        env['PATH']=str(binary.parent)+os.pathsep+env.get('PATH','');return env
+
+def python_env_valid(py):
+    if not py.is_file(): return False
+    try:
+        p=subprocess.run([str(py),'-c',"import sys,docx,PIL; assert (sys.version_info.major,sys.version_info.minor)==("+str(sys.version_info.major)+","+str(sys.version_info.minor)+"); assert tuple(map(int,docx.__version__.split('.')[:2])) >= (1,1) and int(docx.__version__.split('.')[0]) < 2; assert 10 <= int(PIL.__version__.split('.')[0]) < 13"],capture_output=True,timeout=20)
+        return p.returncode==0
+    except (OSError,subprocess.SubprocessError): return False
+
+def prepare_python_env(cache,env,log):
+    base=str(pathlib.Path(sys.executable).resolve());fingerprint=hashlib.sha256(base.encode('utf-8')).hexdigest()[:10]
+    tag=f'python-{sys.version_info.major}.{sys.version_info.minor}-{os.uname().machine}-{fingerprint}'
+    venv=cache/tag;py=venv/'bin/python'
+    with cache_lock(cache,tag):
+        if python_env_valid(py):
+            print('[缓存] 复用共享 Python 报告环境。',flush=True);return py
+        if not py.is_file():
+            print('[缓存] 创建共享 Python 报告环境。',flush=True)
+            command([sys.executable,'-m','venv',str(venv)],logfile=log,env=env,timeout=600)
+        command([str(py),'-m','pip','install','python-docx>=1.1,<2','Pillow>=10,<13'],logfile=log,env=env,timeout=600)
+        if not python_env_valid(py): raise SetupError('共享 Python 报告环境安装后仍不可用；请查看准备过程.log。')
+    return py
+
+def mobile_tool_valid(prefix,platform_arch):
+    modules=prefix/'node_modules';meta=modules/'@mobilenext/mobile-mcp/package.json';binary=modules/'.bin/mcp-server-mobile'
+    try:
+        data=json.loads(meta.read_text(encoding='utf-8'))
+        if data.get('version')!='1.0.17' or not binary.is_file() or not os.access(binary,os.X_OK): return False
+        # mobile-mcp requires its matching per-platform mobilecli executable.
+        token=platform_arch.replace('-x64','-amd64')
+        native='mobilecli-'+token
+        candidates=[modules/'@mobilenext'/native/native,modules/'mobilecli/bin'/native]
+        return any(x.is_file() and os.access(x,os.X_OK) for x in candidates)
+    except (OSError,ValueError,AttributeError): return False
+
+def finished_runs(root):
+    for previous in sorted(root.parent.glob('android01-*'),reverse=True):
+        if previous==root: continue
+        try: info=json.loads((previous/'实验状态.json').read_text(encoding='utf-8'))
+        except (OSError,ValueError): continue
+        if isinstance(info,dict) and info.get('app_commit')==APP_REV and info.get('finished_utc'): yield previous
+
+def safe_mobile_links(prefix):
+    modules=prefix/'node_modules';base=modules.resolve()
+    for path in modules.rglob('*'):
+        if path.is_symlink():
+            try:
+                if not path.resolve().is_relative_to(base): return False
+            except (OSError,RuntimeError): return False
+    return True
+
+def prepare_mobile_tool(root,cache,env,log,install_if_missing=True):
+    try:
+        node=subprocess.run(['node','-p',"process.platform+'-'+process.arch"],env=env,capture_output=True,text=True,timeout=20)
+        platform_arch=node.stdout.strip()
+        if node.returncode or not re.fullmatch(r'(darwin|linux)-(x64|arm64)',platform_arch): raise ValueError()
+    except (OSError,ValueError,subprocess.SubprocessError): raise SetupError('无法确定 Node.js 所使用的平台与处理器架构。')
+    target=cache/('mobile-mcp-1.0.17-'+platform_arch)
+    with cache_lock(cache,'mobile-mcp-'+platform_arch):
+        if mobile_tool_valid(target,platform_arch):
+            print('[缓存] 复用共享移动设备工具。',flush=True);return target/'node_modules/.bin/mcp-server-mobile'
+        with tempfile.TemporaryDirectory(prefix='.mobile-mcp-',dir=cache) as tmp:
+            stage=pathlib.Path(tmp)/'package';migrated=False
+            for previous in finished_runs(root):
+                source=previous/'设备工具'
+                try:
+                    if not mobile_tool_valid(source,platform_arch) or not safe_mobile_links(source): continue
+                    print('[缓存] 将已完成批次的移动设备工具复制到公共缓存。',flush=True)
+                    with heartbeat('正在迁移移动设备工具'):
+                        shutil.copytree(source,stage,symlinks=True)
+                    migrated=mobile_tool_valid(stage,platform_arch)
+                    if migrated:break
+                except (OSError,shutil.Error) as exc:
+                    print('[缓存] 旧设备工具暂时无法复制，将尝试其他批次或重新安装：',type(exc).__name__,flush=True)
+                if stage.exists():shutil.rmtree(stage)
+            if not migrated and not install_if_missing:return None
+            if not migrated:
+                print('[缓存] 安装共享移动设备工具。',flush=True)
+                command(['npm','install','--prefix',str(stage),'--no-audit','--no-fund','@mobilenext/mobile-mcp@1.0.17'],env=env,logfile=log,timeout=900)
+            if not mobile_tool_valid(stage,platform_arch): raise SetupError('移动设备工具安装不完整或平台架构不匹配。')
+            if target.exists() or target.is_symlink():
+                # Preserve the existing cache rather than deleting it on repair.
+                target.rename(cache/(target.name+'-待检查-'+str(time.time_ns())))
+            stage.rename(target)
+            if migrated:print('[缓存] 移动设备工具已迁至公共缓存。',flush=True)
+    return target/'node_modules/.bin/mcp-server-mobile'
+
 def experiment_codex_login(env,cache):
     isolated=env.copy(); isolated['CODEX_HOME']=str(cache/'codex官方登录')
     pathlib.Path(isolated['CODEX_HOME']).mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -319,7 +455,8 @@ def codex_connection_check(env,root,cache):
         if client==0:
             print('[模型检查] 正在实验缓存中安装新版 Codex，更新其模型列表；不会替换系统中的 Codex。',flush=True)
             target=cache/'codex新版'
-            command(['npm','install','--prefix',str(target),'--no-audit','--no-fund','@openai/codex@latest'],env=env,logfile=root/'准备过程.log',timeout=900)
+            with cache_lock(cache,'codex'):
+                command(['npm','install','--prefix',str(target),'--no-audit','--no-fund','@openai/codex@latest'],env=env,logfile=root/'准备过程.log',timeout=900)
             binary=target/'node_modules/.bin/codex'
             if not binary.is_file(): raise SetupError('新版 Codex 安装后未找到可执行文件，请查看准备过程.log。')
             env=env.copy();env['PATH']=str(binary.parent)+os.pathsep+env.get('PATH','')
@@ -510,19 +647,62 @@ def tool(sdk,*paths):
     raise SetupError(f'Android SDK 安装后仍缺少 {paths[0]}；请查看准备过程.log。')
 
 def gradle_cache_home(root,cache):
-    """Reuse only an earlier finished run for this exact pinned application."""
-    shared=cache/'Gradle缓存'
-    if shared.is_dir(): return shared
-    for previous in sorted(root.parent.glob('android01-*'),reverse=True):
-        if previous==root: continue
-        existing=previous/'Gradle缓存'; manifest=previous/'实验状态.json'
-        if not existing.is_dir() or not manifest.is_file(): continue
-        try: info=json.loads(manifest.read_text(encoding='utf-8'))
-        except (OSError,ValueError): continue
-        if isinstance(info,dict) and info.get('app_commit')==APP_REV and info.get('finished_utc'):
-            print('[Gradle] 复用上次已完成运行的依赖缓存，避免重新下载。',flush=True)
-            return existing
-    shared.mkdir(parents=True,exist_ok=True); return shared
+    """Copy reusable downloads out of completed runs; never depend on old runs."""
+    shared=cache/'Gradle缓存';marker=shared/'.旧批次下载已迁移'
+    with cache_lock(cache,'gradle-migration'):
+        shared.mkdir(parents=True,exist_ok=True)
+        completed=set()
+        try:
+            state=json.loads(marker.read_text(encoding='utf-8'))
+            if isinstance(state,dict) and isinstance(state.get('runs'),list):completed={x for x in state['runs'] if isinstance(x,str)}
+        except (OSError,ValueError):pass
+        seen=set();migrated=0;any_failed=False
+        def ignore(folder,names):
+            return [name for name in names if name.endswith(('.lock','.lck','.tmp','.part')) or name.startswith('.copy-') or (pathlib.Path(folder)/name).is_symlink()]
+        def copy_if_missing(source,destination):
+            dest=pathlib.Path(destination)
+            if dest.exists():return str(dest)
+            tmp=None
+            try:
+                with tempfile.NamedTemporaryFile(prefix='.copy-',dir=dest.parent,delete=False) as f:tmp=pathlib.Path(f.name)
+                shutil.copy2(source,tmp)
+                if not dest.exists(): os.replace(tmp,dest)
+            finally:
+                if tmp and tmp.exists():tmp.unlink()
+            return str(dest)
+        for previous in finished_runs(root):
+            if previous.name in completed:continue
+            batch_failed=False
+            for name in ('Gradle缓存','Gradle备用配置'):
+                source=previous/name
+                if not source.is_dir():continue
+                try:
+                    content=(source/'caches/modules-2/files-2.1')
+                    if content.is_dir() and content.resolve() not in seen:
+                        if migrated==0:print('[缓存] 将旧批次的 Gradle 下载复制到公共缓存；旧文件会保留。',flush=True)
+                        with heartbeat('正在迁移已下载的 Gradle 依赖'):
+                            shutil.copytree(content,shared/'caches/modules-2/files-2.1',dirs_exist_ok=True,ignore=ignore,copy_function=copy_if_missing)
+                        seen.add(content.resolve());migrated+=1
+                    dists=source/'wrapper/dists'
+                    if dists.is_dir() and dists.resolve() not in seen:
+                        for version in dists.iterdir():
+                            if not version.is_dir() or version.is_symlink():continue
+                            for package in version.iterdir():
+                                if not package.is_dir() or package.is_symlink() or not any(package.glob('*.ok')):continue
+                                with heartbeat('正在迁移已验证的 Gradle 发行包'):
+                                    shutil.copytree(package,shared/'wrapper/dists'/version.name/package.name,dirs_exist_ok=True,ignore=ignore,copy_function=copy_if_missing)
+                        seen.add(dists.resolve())
+                except (OSError,shutil.Error) as exc:
+                    batch_failed=True;any_failed=True;print('[缓存] 部分旧缓存暂时无法复制，将继续使用已有文件并在下次重试：',type(exc).__name__,flush=True)
+            if not batch_failed:completed.add(previous.name)
+        with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',prefix='.gradle-migration-',dir=shared,delete=False) as f:
+            json.dump({'version':1,'runs':sorted(completed)},f,ensure_ascii=False);temporary=pathlib.Path(f.name)
+        try:os.replace(temporary,marker)
+        finally:
+            if temporary.exists():temporary.unlink()
+        if migrated:print('[缓存] Gradle 文件已迁至公共缓存；Gradle 会在线校验并补齐索引。',flush=True)
+        if not any_failed:print('[缓存] 旧批次 Gradle 下载检查完成。',flush=True)
+    return shared
 
 def gradle_mirror_home(root,shared):
     """Keep the official Maven Central mirror scoped to this experiment."""
@@ -817,40 +997,39 @@ def main():
             for name in ('git','python3'):
                 if not shutil.which(name): raise SetupError(f'缺少 {name}；请先安装后重新运行。')
             cache=pathlib.Path.home()/'codex-agent-experiments/工具缓存'; cache.mkdir(parents=True,exist_ok=True)
-            env=os.environ.copy(); env['npm_config_cache']=str(cache/'npm缓存')
-            env=node22(env,cache)
-            if not shutil.which('codex',path=env.get('PATH')):
-                print('正在本次实验目录安装 Codex CLI。',flush=True)
-                command(['npm','install','--prefix',str(root/'codex工具'),'--no-audit','--no-fund','@openai/codex'],env=env,logfile=log,timeout=900)
-                env['PATH']=str(root/'codex工具/node_modules/.bin')+os.pathsep+env['PATH']
+            env=os.environ.copy(); env['npm_config_cache']=str(cache/'npm缓存'); env.setdefault('PIP_CACHE_DIR',str(cache/'pip缓存'))
+            shared_gradle=gradle_cache_home(root,cache)
+            with cache_lock(cache,'node'):
+                env=node22(env,cache)
+            env=ensure_codex(env,cache,log,root)
+            shared_mcp=prepare_mobile_tool(root,cache,env,log,install_if_missing=False)
             if subprocess.run(['codex','login','status'],env=env).returncode:
                 print('未发现 Codex 登录，将为本实验准备独立登录。',flush=True)
                 env=experiment_codex_login(env,cache)
             env,selected_model=codex_connection_check(env,root,cache)
             info['model_selection']=selected_model or 'Codex 默认模型（未显式指定）'
-            env=java21(env,cache)
-            sdk=locate_sdk(cache); env['ANDROID_HOME']=str(sdk); env['ANDROID_SDK_ROOT']=str(sdk)
-            sdkmanager,avdmanager=prepare_sdk_manager(sdk,cache)
-            abi='arm64-v8a' if os.uname().machine.lower() in ('arm64','aarch64') else 'x86_64'
-            image='system-images;android-34;google_apis;'+abi
-            needed=[]
-            for rel,package in [('platform-tools/adb','platform-tools'),('emulator/emulator','emulator'),('platforms/android-36','platforms;android-36'),('system-images/android-34/google_apis/'+abi,image)]:
-                if not (sdk/rel).exists(): needed.append(package)
-            if needed:
-                print('将自动安装缺少的 Android SDK 组件；如出现许可协议，请在窗口中阅读并选择。',flush=True)
-                command([sdkmanager,'--sdk_root='+str(sdk),'--install',*needed],env=env,interactive=True,timeout=3600)
-            adb=tool(sdk,'platform-tools/adb'); emulator=tool(sdk,'emulator/emulator')
+            with cache_lock(cache,'jdk'):
+                env=java21(env,cache)
+            with cache_lock(cache,'android-sdk',seconds=4200):
+                sdk=locate_sdk(cache); env['ANDROID_HOME']=str(sdk); env['ANDROID_SDK_ROOT']=str(sdk)
+                sdkmanager,avdmanager=prepare_sdk_manager(sdk,cache)
+                abi='arm64-v8a' if os.uname().machine.lower() in ('arm64','aarch64') else 'x86_64'
+                image='system-images;android-34;google_apis;'+abi
+                needed=[]
+                for rel,package in [('platform-tools/adb','platform-tools'),('emulator/emulator','emulator'),('platforms/android-36','platforms;android-36'),('system-images/android-34/google_apis/'+abi,image)]:
+                    if not (sdk/rel).exists(): needed.append(package)
+                if needed:
+                    print('将自动安装缺少的 Android SDK 组件；如出现许可协议，请在窗口中阅读并选择。',flush=True)
+                    command([sdkmanager,'--sdk_root='+str(sdk),'--install',*needed],env=env,interactive=True,timeout=3600)
+                adb=tool(sdk,'platform-tools/adb'); emulator=tool(sdk,'emulator/emulator')
             info['codex_version']=subprocess.run(['codex','--version'],env=env,capture_output=True,text=True).stdout.strip()
-            venv=root/'工具环境'; command([sys.executable,'-m','venv',str(venv)],logfile=log)
-            py=venv/'bin/python'; command([str(py),'-m','pip','install','python-docx>=1.1,<2','Pillow>=10,<13'],logfile=log,env=env,timeout=600)
+            py=prepare_python_env(cache,env,log)
             if sys.platform!='darwin' and not shutil.which('magick',path=env.get('PATH')):
                 helper=root/'辅助命令'; helper.mkdir()
                 resize=helper/'magick'; resize.write_text('#!'+str(py)+'\nfrom PIL import Image\nimport sys\nif len(sys.argv)!=5 or sys.argv[2]!="-resize": raise SystemExit("仅支持 magick 输入 -resize 宽x高 输出")\nw,h=(int(x) for x in sys.argv[3].split("x")); image=Image.open(sys.argv[1]); image.thumbnail((w,h)); image.save(sys.argv[4])\n'); resize.chmod(0o755)
                 env['PATH']=str(helper)+os.pathsep+env['PATH']
         with phase('准备设备操作服务'):
-            command(['npm','install','--prefix',str(root/'设备工具'),'--no-audit','--no-fund','@mobilenext/mobile-mcp@1.0.17'],env=env,logfile=log,timeout=900)
-            mcp=root/'设备工具/node_modules/.bin/mcp-server-mobile'
-            if not mcp.is_file(): raise SetupError('设备操作服务安装后缺少可执行入口。')
+            mcp=shared_mcp or prepare_mobile_tool(root,cache,env,log)
             env['ANDROID_EXPERIMENT_MCP_COMMAND']=str(mcp)
             info['device_tool']='@mobilenext/mobile-mcp@1.0.17'
         with phase('准备 Android SDK 与两个模拟器'):
@@ -875,7 +1054,7 @@ def main():
             skills=project/'.agents/skills'; skills.mkdir(parents=True,exist_ok=True)
             shutil.copytree(flow/'skills/android-bug-priority-tree',skills/'android-bug-priority-tree')
             # Existing project checkout is an isolated experiment copy.
-            env['GRADLE_USER_HOME']=str(gradle_cache_home(root,cache))
+            env['GRADLE_USER_HOME']=str(shared_gradle)
         with phase('构建应用和设备测试'):
             print('[构建] 正在解析依赖并构建应用和设备测试 APK；首次构建可能较慢。输出和状态会持续显示。',flush=True)
             build_gradle_with_retry(project,root,env,log,info)
