@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone Android/Codex experiment. Run by double-click or python3."""
 from __future__ import annotations
-import base64, collections, contextlib, csv, datetime as dt, hashlib, html, json, math, os, pathlib, re, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request, webbrowser, xml.etree.ElementTree as ET, zipfile, zlib
+import base64, codecs, collections, contextlib, csv, datetime as dt, hashlib, html, json, math, os, pathlib, re, selectors, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request, webbrowser, xml.etree.ElementTree as ET, zipfile, zlib
 
 APP_URL = 'https://github.com/android/nowinandroid.git'
 APP_REV = 'a49ed253d75e61a2b6ab80a8da677b57437b08eb'
@@ -12,17 +12,108 @@ RUNNER = 'eNrFPGt328aV3/UrsO7xAdiAsOT0kaWKnnVsp/Gpk/jETrutyuWBSEhCRAIoAFJSVO2Rk8
 
 class SetupError(Exception): pass
 
-def command(argv, *, cwd=None, env=None, logfile=None, timeout=None, stdin=None, interactive=False):
+HEARTBEAT_SECONDS=15
+
+def clock(seconds):
+    seconds=max(0,int(seconds)); return f'{seconds//60:02d}:{seconds%60:02d}'
+
+def file_activity(paths):
+    details=[]
+    for label,path in paths or []:
+        try:
+            st=path.stat(); age=max(0,int(time.time()-st.st_mtime))
+            details.append(f'{label} {st.st_size:,} 字节，{age} 秒前更新')
+        except OSError: details.append(f'{label}尚未生成')
+    if paths:
+        for label,path in paths:
+            if label!='事件记录': continue
+            try:
+                with path.open('rb') as f:
+                    f.seek(0,os.SEEK_END); size=f.tell(); f.seek(max(0,size-32768)); lines=f.read().splitlines()
+                for line in reversed(lines):
+                    try: event=json.loads(line)
+                    except (ValueError,UnicodeDecodeError): continue
+                    if not isinstance(event,dict): continue
+                    kind=event.get('type',''); item=event.get('item') or {}; subkind=item.get('type','') if isinstance(item,dict) else ''
+                    if not isinstance(kind,str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,100}',kind): continue
+                    if not isinstance(subkind,str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{0,100}',subkind): subkind=''
+                    details.append('最近 Codex 事件 '+kind+(' / '+subkind if subkind else '')); break
+            except OSError: pass
+    return '；'.join(details)
+
+@contextlib.contextmanager
+def heartbeat(message,interval=HEARTBEAT_SECONDS):
+    start=time.monotonic(); stop=threading.Event()
+    def monitor():
+        while not stop.wait(interval):
+            print(f'\n[状态] {message}；已等待 {clock(time.monotonic()-start)}。进程或连接尚未返回，不能仅凭此判断进度。',flush=True)
+    thread=threading.Thread(target=monitor,daemon=True); thread.start()
+    try: yield
+    finally: stop.set(); thread.join(timeout=1)
+
+def stop_group(p):
+    if p.poll() is not None: return
+    try: os.killpg(p.pid,signal.SIGINT)
+    except ProcessLookupError: return
+    try: p.wait(timeout=8); return
+    except subprocess.TimeoutExpired: pass
+    try: os.killpg(p.pid,signal.SIGTERM)
+    except ProcessLookupError: return
+    try: p.wait(timeout=5); return
+    except subprocess.TimeoutExpired: pass
+    try: os.killpg(p.pid,signal.SIGKILL)
+    except ProcessLookupError: pass
+    p.wait()
+
+def command(argv, *, cwd=None, env=None, logfile=None, timeout=None, stdin=None, interactive=False, check=True, watch_paths=None):
     print('\n$', ' '.join(str(x) for x in argv), flush=True)
     offset=0
     if interactive:
-        p = subprocess.run(argv, cwd=cwd, env=env, timeout=timeout, input=stdin, text=True)
+        print('[提示] 请留意登录或许可输入提示；下载和安装期间请保持窗口打开。',flush=True)
+        with heartbeat('操作尚未返回，也可能正在等待你的输入',interval=30):
+            p=subprocess.run(argv,cwd=cwd,env=env,timeout=timeout,input=stdin,text=True)
     else:
-        with open(logfile, 'a', encoding='utf-8') as log:
-            log.write('\n$ ' + ' '.join(map(str, argv)) + '\n'); log.flush()
+        start=time.monotonic(); last_output=start; next_heartbeat=start+HEARTBEAT_SECONDS
+        with open(logfile,'a',encoding='utf-8') as log:
+            log.write('\n$ '+' '.join(map(str,argv))+'\n'); log.flush()
             offset=os.fstat(log.fileno()).st_size
-            p = subprocess.run(argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout, input=stdin, text=True)
-    if p.returncode:
+            p=subprocess.Popen(argv,cwd=cwd,env=env,stdin=subprocess.PIPE if stdin is not None else None,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True)
+            if stdin is not None:
+                try: p.stdin.write(stdin.encode('utf-8')); p.stdin.close()
+                except BrokenPipeError: pass
+            decoder=codecs.getincrementaldecoder('utf-8')(errors='replace'); exited_at=None
+            selector=selectors.DefaultSelector(); selector.register(p.stdout,selectors.EVENT_READ)
+            try:
+                while True:
+                    now=time.monotonic()
+                    if timeout is not None and now-start>=timeout:
+                        stop_group(p); raise subprocess.TimeoutExpired(argv,timeout)
+                    for key,_ in selector.select(timeout=0.5):
+                        data=os.read(key.fd,8192)
+                        if not data: selector.unregister(key.fileobj); continue
+                        chunk=decoder.decode(data); log.write(chunk); log.flush(); sys.stdout.write(chunk); sys.stdout.flush(); last_output=time.monotonic()
+                    now=time.monotonic()
+                    alive=p.poll() is None
+                    if not alive:
+                        if not selector.get_map(): break
+                        if exited_at is None: exited_at=now
+                        if now-exited_at>=1: break
+                    if now>=next_heartbeat:
+                        silent=int(now-last_output); details=file_activity(watch_paths)
+                        state='命令进程仍在运行' if alive else '命令主进程已退出，正在读取剩余输出'
+                        text=f'\n[状态] {state}；已耗时 {clock(now-start)}，距上次窗口输出 {silent} 秒。'
+                        if timeout is not None: text+=f' 超时上限 {clock(timeout)}（并非预计完成时间）。'
+                        if details: text+=' '+details+'。'
+                        if silent>=60: text+=' 暂无新输出；可能正在下载或处理，不能确认已有进展。'
+                        print(text,flush=True); next_heartbeat=now+HEARTBEAT_SECONDS
+                rest=decoder.decode(b'',final=True)
+                if rest: log.write(rest); log.flush(); sys.stdout.write(rest); sys.stdout.flush()
+                p.wait()
+            except BaseException:
+                stop_group(p); raise
+            finally:
+                selector.close(); p.stdout.close()
+    if p.returncode and check:
         detail=''
         if logfile:
             try:
@@ -42,20 +133,29 @@ def host():
     return system,arch
 
 def fetch_bytes(url):
-    with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'android-agent-experiment/1.0'}),timeout=60) as r:
-        return r.read()
+    with heartbeat('正在获取下载清单，可能正在等待网络'):
+        with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'android-agent-experiment/1.0'}),timeout=60) as r:
+            return r.read()
 
 def download(url, dest, checksum, algorithm='sha256'):
     if not re.fullmatch(r'[0-9a-fA-F]{%d}' % (40 if algorithm=='sha1' else 64),checksum): raise SetupError('下载校验值格式不正确。')
     print('下载：',url,flush=True)
-    digest=hashlib.new(algorithm)
-    with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'android-agent-experiment/1.0'}),timeout=120) as r, dest.open('wb') as out:
-        while True:
-            block=r.read(1024*1024)
-            if not block: break
-            digest.update(block); out.write(block)
+    digest=hashlib.new(algorithm); received=0; started=time.monotonic(); next_update=started+5
+    with heartbeat('下载连接尚未返回，可能正在等待网络'):
+        with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'android-agent-experiment/1.0'}),timeout=120) as r, dest.open('wb') as out:
+            headers=getattr(r,'headers',{}); length=headers.get('Content-Length') if headers else None
+            total=int(length) if length and length.isdigit() else None
+            while True:
+                block=r.read(1024*1024)
+                if not block: break
+                digest.update(block); out.write(block); received+=len(block)
+                now=time.monotonic()
+                if now>=next_update:
+                    percent=f' / {total/1048576:.1f} MiB（{min(100,100*received/total):.1f}%）' if total else ''
+                    print(f'[下载] 已接收 {received/1048576:.1f} MiB{percent}，已耗时 {clock(now-started)}',flush=True); next_update=now+5
     if digest.hexdigest().lower()!=checksum.lower():
         dest.unlink(missing_ok=True); raise SetupError('下载文件校验失败；已丢弃文件，请检查网络后重试。')
+    print(f'[下载] 已完成并校验 {received/1048576:.1f} MiB，耗时 {clock(time.monotonic()-started)}。',flush=True)
 
 def safe_tar(archive,dest):
     root=dest.resolve()
@@ -110,7 +210,10 @@ def java21(env,cache):
     sha=fetch_bytes(base+filename+'.sha256.txt').decode('ascii').split()[0]
     with tempfile.TemporaryDirectory(prefix='jdk-',dir=cache) as tmp:
         tmp=pathlib.Path(tmp); archive=tmp/'jdk.tar.gz'; unpack=tmp/'unpack'; unpack.mkdir()
-        download(base+filename,archive,sha); safe_tar(archive,unpack)
+        download(base+filename,archive,sha)
+        print('[安装] 正在解压 JDK。',flush=True)
+        with heartbeat('正在解压 JDK'):
+            safe_tar(archive,unpack)
         matches=list(unpack.glob('*/bin/java'))+list(unpack.glob('*/Contents/Home/bin/java'))
         if len(matches)!=1 or not java_valid(matches[0]): raise SetupError('下载的 JDK 无法运行或版本不兼容。')
         source=matches[0].parent.parent
@@ -134,7 +237,10 @@ def node22(env,cache):
         if len(hashes)!=1: raise SetupError('未找到 Node.js 下载包的官方校验值。')
         with tempfile.TemporaryDirectory(prefix='node-',dir=cache) as tmp:
             tmp=pathlib.Path(tmp); archive=tmp/'node.tar.gz'; unpack=tmp/'unpack'; unpack.mkdir()
-            download(base+name,archive,hashes[0]); safe_tar(archive,unpack)
+            download(base+name,archive,hashes[0])
+            print('[安装] 正在解压 Node.js。',flush=True)
+            with heartbeat('正在解压 Node.js'):
+                safe_tar(archive,unpack)
             roots=list(unpack.iterdir())
             if len(roots)!=1 or not (roots[0]/'bin/node').is_file() or not (roots[0]/'bin/npm').is_file(): raise SetupError('Node.js 下载包结构异常。')
             if cached.exists(): shutil.rmtree(cached)
@@ -164,7 +270,8 @@ def prepare_sdk_manager(sdk,cache):
         stage=pathlib.Path(stage_dir); source=stage/'tools'
         if usable(cached):
             print('修复 Android 工具目录：复用已下载的缓存，放入当前 SDK。',flush=True)
-            shutil.copytree(cached,source,symlinks=True)
+            with heartbeat('正在复制已缓存的 Android 命令行工具'):
+                shutil.copytree(cached,source,symlinks=True)
         else:
             print('未发现 Android 命令行工具，自动从 Google 下载。',flush=True)
             repo='https://dl.google.com/android/repository/'
@@ -178,7 +285,10 @@ def prepare_sdk_manager(sdk,cache):
             else: raise SetupError('Google SDK 列表中没有当前系统对应的命令行工具。')
             if not name or '/' in name or not checksum: raise SetupError('Google SDK 下载清单格式异常。')
             file=stage/'sdk.zip'; unpack=stage/'unpack'; unpack.mkdir()
-            download(repo+name,file,checksum,'sha1'); safe_zip(file,unpack)
+            download(repo+name,file,checksum,'sha1')
+            print('[安装] 正在解压 Android 命令行工具。',flush=True)
+            with heartbeat('正在解压 Android 命令行工具'):
+                safe_zip(file,unpack)
             shutil.move(str(unpack/'cmdline-tools'),str(source))
         if not usable(source): raise SetupError('Android 命令行工具包结构异常或没有执行权限。')
         # Never overwrite an existing user installation, even if it is incomplete.
@@ -210,11 +320,16 @@ def ports(count):
     raise SetupError('找不到两个空闲模拟器端口。')
 
 def booted(adb, serial, env, proc, seconds=360):
-    end=time.monotonic()+seconds
+    start=time.monotonic(); end=start+seconds; next_status=start+HEARTBEAT_SECONDS
+    print(f'[模拟器] 等待 {serial} 启动，最多等待 {seconds} 秒。',flush=True)
     while time.monotonic()<end:
         if proc.poll() is not None: raise SetupError(f'{serial} 模拟器提前退出，请查看其日志。')
         p=subprocess.run([adb,'-s',serial,'shell','getprop','sys.boot_completed'],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=10)
-        if p.returncode==0 and p.stdout.strip()=='1': return
+        if p.returncode==0 and p.stdout.strip()=='1':
+            print(f'[模拟器] {serial} 已启动，用时 {clock(time.monotonic()-start)}。',flush=True); return
+        now=time.monotonic()
+        if now>=next_status:
+            print(f'[模拟器] {serial} 进程仍在运行，尚未收到启动完成信号；已等待 {clock(now-start)}。',flush=True); next_status=now+HEARTBEAT_SECONDS
         time.sleep(3)
     raise SetupError(f'{serial} 在 {seconds} 秒内未完成启动。')
 
@@ -345,12 +460,17 @@ def main():
     root.mkdir(parents=True,exist_ok=False); print('本次实验目录：',root,flush=True)
     log=root/'准备过程.log'; info={'status':'准备中','app_url':APP_URL,'app_commit':APP_REV,'workflow_url':FLOW_URL,'workflow_commit':FLOW_REV,'devices':[],'launcher_started_utc':dt.datetime.now(dt.timezone.utc).isoformat()}
     processes=[]; files=[]; stop=threading.Event(); sampler=None; code=1
+    stages=['检查工具与登录','准备设备操作服务','准备 Android SDK 与两个模拟器','下载固定应用和公开工作流','构建应用和设备测试','运行真实 Codex 多 Agent']
     @contextlib.contextmanager
     def phase(name):
-        print('\n【'+name+'】',flush=True)
+        number=stages.index(name)+1 if name in stages else '?'
+        print(f'\n【阶段 {number}/{len(stages)}：{name}】',flush=True); stage_started=time.monotonic()
         try: yield
         except BaseException:
-            info['failed_stage']=name; raise
+            info['failed_stage']=name; print(f'[阶段] {name} 失败或中断；本阶段耗时 {clock(time.monotonic()-stage_started)}。',flush=True); raise
+        else:
+            suffix='（准备阶段耗时不计入正式开发报告）' if name!='运行真实 Codex 多 Agent' else ''
+            print(f'[阶段] {name} 完成；本阶段耗时 {clock(time.monotonic()-stage_started)}{suffix}。',flush=True)
     try:
         with phase('检查工具与登录'):
             if sys.platform=='darwin': os.environ['PATH']='/opt/homebrew/bin:/usr/local/bin:'+os.environ.get('PATH','')
@@ -415,15 +535,15 @@ def main():
             # Existing project checkout is an isolated experiment copy.
             env['GRADLE_USER_HOME']=str(root/'Gradle缓存')
         with phase('构建应用和设备测试'):
-            command(['./gradlew',':app:assembleDemoDebug',':app:assembleDemoDebugAndroidTest','--no-daemon'],cwd=project,env=env,logfile=log,timeout=2700)
+            print('[构建] 正在解析依赖并构建应用和设备测试 APK；首次构建可能较慢。输出和状态会持续显示。',flush=True)
+            command(['./gradlew',':app:assembleDemoDebug',':app:assembleDemoDebugAndroidTest','--no-daemon','--console=plain'],cwd=project,env=env,logfile=log,timeout=2700)
             app_apks=list((project/'app/build/outputs/apk/demo/debug').glob('*.apk'))
             test_apks=list((project/'app/build/outputs/apk/androidTest/demo/debug').glob('*.apk'))
             if len(app_apks)!=1 or len(test_apks)!=1: raise SetupError(f'APK 数量不符合预期：应用 {len(app_apks)}，测试 {len(test_apks)}。')
             for serial,_ in processes:
                 for apk in (app_apks[0],test_apks[0]): command([adb,'-s',serial,'install','-r',str(apk)],env=env,logfile=log,timeout=180)
                 testlog=root/(serial+'-基线测试.log')
-                with testlog.open('w',encoding='utf-8') as f:
-                    p=subprocess.run([adb,'-s',serial,'shell','am','instrument','-w',APP_ID+'.test/com.google.samples.apps.nowinandroid.core.testing.NiaTestRunner'],env=env,stdout=f,stderr=subprocess.STDOUT,timeout=900)
+                p=command([adb,'-s',serial,'shell','am','instrument','-w',APP_ID+'.test/com.google.samples.apps.nowinandroid.core.testing.NiaTestRunner'],env=env,logfile=testlog,timeout=900,check=False)
                 text=testlog.read_text(encoding='utf-8',errors='replace')
                 match=re.search(r'OK\s*\(\s*(\d+)\s+tests?\s*\)',text)
                 if p.returncode or not match or int(match.group(1))<1 or re.search(r'FAILURES!!!|INSTRUMENTATION_FAILED|INSTRUMENTATION_ABORTED',text):
@@ -438,10 +558,15 @@ def main():
             needle="    cmd.append('-')"
             addition="    if os.environ.get('ANDROID_EXPERIMENT_MCP_COMMAND'):\n        cmd.extend(['-c', 'mcp_servers.mobile-mcp.command=' + json.dumps(os.environ['ANDROID_EXPERIMENT_MCP_COMMAND']), '-c', 'sandbox_workspace_write.network_access=true'])\n"
             if source.count(needle)!=1: raise SetupError('内置采集器配置入口不匹配。')
-            runner.write_text(source.replace(needle,addition+needle),encoding='utf-8')
+            source=source.replace(needle,addition+needle)
+            timeout_handler='            except subprocess.TimeoutExpired:\n                timed_out=True; code=124\n'
+            interrupt_handler="            except KeyboardInterrupt:\n                try: os.killpg(proc.pid,signal.SIGTERM)\n                except ProcessLookupError: pass\n                try: proc.wait(timeout=5)\n                except subprocess.TimeoutExpired:\n                    try: os.killpg(proc.pid,signal.SIGKILL)\n                    except ProcessLookupError: pass\n                    proc.wait()\n                raise\n"
+            if source.count(timeout_handler)!=1: raise SetupError('内置采集器中断处理入口不匹配。')
+            runner.write_text(source.replace(timeout_handler,interrupt_handler+timeout_handler),encoding='utf-8')
             env['RUST_LOG']=(env.get('RUST_LOG','error')+',codex_otel.agent_communication=info')
             env['PATH']=str(sdk/'platform-tools')+os.pathsep+str(sdk/'emulator')+os.pathsep+env['PATH']
-            p=subprocess.run([str(py),str(runner),'--project',str(project),'--mode','write','--timeout','7200','--prompt',str(root/'本次任务.txt'),'--output',str(root/'记录')],env=env)
+            print('[Codex] 正式任务最长运行 2 小时；定期显示原始记录文件变化，不展示模型私有推理内容。',flush=True)
+            p=command([str(py),str(runner),'--project',str(project),'--mode','write','--timeout','7200','--prompt',str(root/'本次任务.txt'),'--output',str(root/'记录')],env=env,logfile=root/'Codex运行.log',timeout=7380,check=False,watch_paths=[('事件记录',root/'记录/codex-events.jsonl'),('诊断日志',root/'记录/codex-stderr.log')])
             info['codex_exit_code']=p.returncode
             meta_path=root/'记录/实验信息.json'
             meta=json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}

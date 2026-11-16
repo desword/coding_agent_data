@@ -1,4 +1,4 @@
-import base64, hashlib, importlib.machinery, importlib.util, io, json, os, pathlib, shutil, sys, tarfile, tempfile, unittest, zlib
+import base64, contextlib, hashlib, importlib.machinery, importlib.util, io, json, os, pathlib, shutil, subprocess, sys, tarfile, tempfile, threading, time, unittest, zlib
 from unittest import mock
 
 ROOT=pathlib.Path(__file__).resolve().parents[2]
@@ -64,6 +64,35 @@ class Integration(unittest.TestCase):
    self.assertIn('尚未启动或未获得正式任务的有效计时',report)
    self.assertIn('准备设备',report)
    self.assertNotIn('Codex 多 Agent 正式任务</td>',report)
+ def test_command_streams_output_before_completion_and_reports_heartbeat(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   logfile=pathlib.Path(tmp)/'progress.log'; terminal=io.StringIO(); failures=[]
+   def run():
+    try: module.command([sys.executable,'-u','-c',"import time;print('EARLY_OUTPUT',flush=True);time.sleep(1.1);print('DONE_OUTPUT',flush=True)"],logfile=logfile,timeout=5)
+    except BaseException as exc: failures.append(exc)
+   with contextlib.redirect_stdout(terminal), mock.patch.object(module,'HEARTBEAT_SECONDS',.2):
+    thread=threading.Thread(target=run); thread.start(); deadline=time.monotonic()+3
+    while time.monotonic()<deadline:
+     if logfile.exists() and '\nEARLY_OUTPUT\n' in logfile.read_text(): break
+     time.sleep(.03)
+    self.assertTrue(thread.is_alive(),'output must be shown while command is still running')
+    self.assertIn('EARLY_OUTPUT',terminal.getvalue())
+    thread.join(timeout=5)
+   self.assertFalse(thread.is_alive()); self.assertFalse(failures)
+   self.assertIn('[状态]',terminal.getvalue()); self.assertIn('进程仍在运行',terminal.getvalue()); self.assertIn('DONE_OUTPUT',terminal.getvalue())
+   self.assertIn('DONE_OUTPUT',logfile.read_text())
+ def test_command_timeout_stops_the_process(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   logfile=pathlib.Path(tmp)/'timeout.log'; start=time.monotonic()
+   with self.assertRaises(subprocess.TimeoutExpired):
+    module.command([sys.executable,'-u','-c',"import time;print('started',flush=True);time.sleep(30)"],logfile=logfile,timeout=.5)
+   self.assertLess(time.monotonic()-start,5)
+   self.assertIn('started',logfile.read_text())
+ def test_log_activity_shows_latest_event_without_message_content(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   event=pathlib.Path(tmp)/'events.jsonl'; event.write_text(json.dumps({'type':'item.started','item':{'type':'command_execution','command':'secret command'}})+'\n')
+   result=module.file_activity([('事件记录',event)])
+   self.assertIn('item.started / command_execution',result); self.assertNotIn('secret command',result)
  def test_failed_command_includes_original_error(self):
   with tempfile.TemporaryDirectory() as tmp:
    with self.assertRaises(module.SetupError) as failure:
