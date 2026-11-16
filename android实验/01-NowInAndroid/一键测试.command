@@ -206,34 +206,129 @@ def experiment_codex_login(env,cache):
         command(['codex','login','status'],env=isolated,interactive=True)
     return isolated
 
+def unavailable_model(errors):
+    text=' '.join(errors).lower()
+    return ('model_not_found' in text or ('model' in text and ('not supported when using codex' in text or 'model is not supported' in text or 'model is not available' in text)))
+
+def rejected_models(errors):
+    found=[]
+    for message in errors:
+        found.extend(re.findall(r"(?i)['\"]([a-z0-9][a-z0-9_.:/-]{0,119})['\"]\s+model",message))
+    return {x.lower() for x in found}
+
+def available_codex_models(env,seconds=25):
+    """Read the CLI model catalog, without reading credentials or guessing availability."""
+    print('[模型检查] 正在询问 Codex 可见的模型列表。',flush=True)
+    process=None; selector=None
+    try:
+        process=subprocess.Popen(['codex','app-server'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,start_new_session=True)
+        requests=[{'id':1,'method':'initialize','params':{'clientInfo':{'name':'android-agent-experiment','version':'1.0'}}},{'method':'initialized','params':{}},{'id':2,'method':'model/list','params':{'limit':100}}]
+        for request in requests: process.stdin.write((json.dumps(request)+'\n').encode('utf-8'))
+        process.stdin.flush()
+        selector=selectors.DefaultSelector(); selector.register(process.stdout,selectors.EVENT_READ)
+        end=time.monotonic()+seconds; next_update=time.monotonic()+15; buffer=b''; entries=[]; request_id=2; cursors=set()
+        while time.monotonic()<end:
+            if process.poll() is not None: break
+            for key,_ in selector.select(timeout=.5):
+                chunk=os.read(key.fd,65536)
+                if not chunk: break
+                buffer+=chunk
+                if len(buffer)>4*1024*1024: return []
+                while b'\n' in buffer:
+                    raw,buffer=buffer.split(b'\n',1)
+                    try: reply=json.loads(raw)
+                    except (ValueError,UnicodeDecodeError): continue
+                    if not isinstance(reply,dict) or reply.get('id')!=request_id: continue
+                    result=reply.get('result')
+                    if not isinstance(result,dict) or not isinstance(result.get('data'),list): return []
+                    entries.extend(result['data'])
+                    cursor=result.get('nextCursor')
+                    if cursor is None or len(cursors)>=2:
+                        valid=[]
+                        for item in entries:
+                            if not isinstance(item,dict) or item.get('hidden') is True or str(item.get('multiAgentVersion','')).lower()=='disabled': continue
+                            name=item.get('model') or item.get('id')
+                            if not isinstance(name,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,119}',name): continue
+                            valid.append((not bool(item.get('isDefault')), 'codex' not in name.lower(), name))
+                        ordered=[]
+                        for _,_,name in sorted(valid):
+                            if name not in ordered: ordered.append(name)
+                        return ordered
+                    if not isinstance(cursor,str) or cursor in cursors: return []
+                    cursors.add(cursor);request_id+=1
+                    process.stdin.write((json.dumps({'id':request_id,'method':'model/list','params':{'limit':100,'cursor':cursor}})+'\n').encode('utf-8'));process.stdin.flush()
+            now=time.monotonic()
+            if now>=next_update:
+                print('[模型检查] 等待 Codex 返回模型列表；尚不能判断账号能否使用某个模型。',flush=True); next_update=now+15
+    except (OSError,ValueError,subprocess.SubprocessError): pass
+    finally:
+        if selector: selector.close()
+        if process:
+            try: os.killpg(process.pid,signal.SIGTERM)
+            except ProcessLookupError: pass
+            try: process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try: os.killpg(process.pid,signal.SIGKILL)
+                except ProcessLookupError: pass
+                process.wait()
+            if process.stdin:
+                with contextlib.suppress(OSError): process.stdin.close()
+            if process.stdout:
+                with contextlib.suppress(OSError): process.stdout.close()
+    return []
+
 def codex_connection_check(env,root,cache):
-    """Check the chosen model before building; never mutate the user's Codex home."""
-    def probe(attempt,probe_env):
-        log=root/f'Codex认证检查-{attempt}.log'
-        print('[认证检查] 正在用一条简短请求检查 Codex 模型访问；这不计入正式实验。',flush=True)
-        try:
-            result=command(['codex','exec','--json','--enable','multi_agent','--sandbox','read-only','--skip-git-repo-check','-C',str(root),'Reply with OK.'],env=probe_env,logfile=log,timeout=120,check=False,show_output=False)
-        except subprocess.TimeoutExpired:
-            raise SetupError(f'Codex 认证检查超过 120 秒；可能是网络或服务问题，详情见 {log}。')
-        terminal,errors=probe_result(log)
+    """Verify auth and choose a model only after a model-specific rejection."""
+    attempts=0; tried=set(); latest_errors=[]; last_log=None
+    def probe(probe_env,model=None):
+        nonlocal attempts,latest_errors,last_log
+        attempts+=1; log=root/f'Codex认证检查-{attempts}.log'; last_log=log
+        print('[认证检查] 正在用一条简短请求检查 '+(f'模型 {model}' if model else 'Codex 默认模型')+'；这不计入正式实验。',flush=True)
+        cmd=['codex','exec','--json','--enable','multi_agent','--sandbox','read-only','--skip-git-repo-check','-C',str(root)]
+        if model: cmd.extend(['--model',model])
+        cmd.append('Reply with OK.')
+        try: result=command(cmd,env=probe_env,logfile=log,timeout=120,check=False,show_output=False)
+        except subprocess.TimeoutExpired: raise SetupError(f'Codex 认证检查超过 120 秒；可能是网络或服务问题，详情见 {log}。')
+        terminal,errors=probe_result(log);latest_errors=errors
         if not result.returncode and terminal=='turn.completed':
-            print('[认证检查] Codex 模型请求成功。',flush=True); return True,errors,log
-        return False,errors,log
-    ok,errors,log=probe(1,env)
-    if ok: return env
-    combined=' '.join(errors).lower()
+            print('[认证检查] Codex 模型请求成功。',flush=True); return True
+        return False
+    def fail(prefix):
+        detail=' | '.join(redact_diagnostic(x) for x in latest_errors[-3:])
+        raise SetupError(prefix+(detail or f'没有取得明确错误；请查看 {last_log}。'))
+    if probe(env): return env,None
+    combined=' '.join(latest_errors).lower()
     invalid_key=('invalid_api_key' in combined or 'incorrect api key' in combined)
-    official_endpoint='https://api.openai.com/' in combined
-    if not (invalid_key and official_endpoint):
-        detail=' | '.join(redact_diagnostic(x) for x in errors[-3:])
-        raise SetupError('Codex 模型连接检查未通过：'+(detail or f'没有取得明确错误；请查看 {log}。'))
-    print('[认证检查] 当前密钥不适用于 OpenAI 官方接口。将为此实验单独使用 ChatGPT 浏览器登录；不会修改已有 Codex 登录或环境变量。',flush=True)
-    isolated=experiment_codex_login(env,cache)
-    ok,errors,log=probe(2,isolated)
-    if not ok:
-        detail=' | '.join(redact_diagnostic(x) for x in errors[-3:])
-        raise SetupError('实验专用登录后的模型连接仍未通过：'+(detail or f'没有取得明确错误；请查看 {log}。'))
-    return isolated
+    if invalid_key and 'https://api.openai.com/' in combined:
+        print('[认证检查] 当前密钥不适用于 OpenAI 官方接口。将为此实验单独使用 ChatGPT 浏览器登录；不会修改已有 Codex 登录或环境变量。',flush=True)
+        env=experiment_codex_login(env,cache)
+        if probe(env): return env,None
+    if not unavailable_model(latest_errors): fail('Codex 模型连接检查未通过：')
+    tried.update(rejected_models(latest_errors))
+    for client in range(2):
+        candidates=available_codex_models(env)
+        usable=[model for model in candidates if model.lower() not in tried][:4]
+        if not usable: print('[模型检查] 当前 Codex 没有提供可继续验证的候选模型。',flush=True)
+        for model in usable:
+            tried.add(model.lower()); print(f'[模型检查] 验证候选模型：{model}',flush=True)
+            if probe(env,model):
+                print(f'[模型检查] 正式任务将使用已验证模型：{model}',flush=True)
+                return env,model
+            if not unavailable_model(latest_errors): fail(f'验证模型 {model} 时发生认证、网络、额度或其他错误：')
+            tried.update(rejected_models(latest_errors))
+        if client==0:
+            print('[模型检查] 正在实验缓存中安装新版 Codex，更新其模型列表；不会替换系统中的 Codex。',flush=True)
+            target=cache/'codex新版'
+            command(['npm','install','--prefix',str(target),'--no-audit','--no-fund','@openai/codex@latest'],env=env,logfile=root/'准备过程.log',timeout=900)
+            binary=target/'node_modules/.bin/codex'
+            if not binary.is_file(): raise SetupError('新版 Codex 安装后未找到可执行文件，请查看准备过程.log。')
+            env=env.copy();env['PATH']=str(binary.parent)+os.pathsep+env.get('PATH','')
+            if probe(env):
+                print('[模型检查] 正式任务将使用已验证的新版 Codex 默认模型。',flush=True)
+                return env,None
+            if not unavailable_model(latest_errors): fail('新版 Codex 的模型连接检查未通过：')
+            tried.update(rejected_models(latest_errors))
+    fail('已检查可见模型并尝试新版 Codex，仍未找到可用模型：')
 
 def host():
     system={'darwin':'mac','linux':'linux'}.get(sys.platform)
@@ -528,6 +623,7 @@ def report(root, info):
     parts.append('<p>运行状态：<b>'+e(str(info.get('status','未知')))+'</b>。 '+e(str(info.get('detail','')))+'</p>')
     if info.get('failed_stage'): parts.append('<p>失败阶段：'+e(str(info['failed_stage']))+'</p>')
     parts.append('<p>应用和基线：Now in Android <code>'+APP_REV+'</code>；公开工作流：Android Bug Priority Tree <code>'+FLOW_REV+'</code>。应用与流程的组合、设备槽位属于本实验配置。</p>')
+    if info.get('model_selection'): parts.append('<p>正式任务模型选择：<code>'+e(str(info['model_selection']))+'</code>。</p>')
     parts.append('<h2>正式开发耗时</h2><p>只计 Codex 多 Agent 正式任务从启动到结束的时间；环境安装、下载、模拟器准备、基线构建和报告生成均不计入。工具调用时间可互相重叠，不能相加得到总耗时。</p><table><tr><th>阶段</th><th>秒</th><th>状态</th></tr>')
     if 'formal_elapsed_seconds' in info:
         parts.append('<tr><td>Codex 多 Agent 正式任务</td><td>'+e(str(info['formal_elapsed_seconds']))+'</td><td>'+e(str(info.get('formal_status','未知')))+'</td></tr>')
@@ -596,7 +692,8 @@ def main():
             if subprocess.run(['codex','login','status'],env=env).returncode:
                 print('未发现 Codex 登录，将为本实验准备独立登录。',flush=True)
                 env=experiment_codex_login(env,cache)
-            env=codex_connection_check(env,root,cache)
+            env,selected_model=codex_connection_check(env,root,cache)
+            info['model_selection']=selected_model or 'Codex 默认模型（未显式指定）'
             env=java21(env,cache)
             sdk=locate_sdk(cache); env['ANDROID_HOME']=str(sdk); env['ANDROID_SDK_ROOT']=str(sdk)
             sdkmanager,avdmanager=prepare_sdk_manager(sdk,cache)
@@ -677,7 +774,9 @@ def main():
             env['RUST_LOG']=(env.get('RUST_LOG','error')+',codex_otel.agent_communication=info')
             env['PATH']=str(sdk/'platform-tools')+os.pathsep+str(sdk/'emulator')+os.pathsep+env['PATH']
             print('[Codex] 正式任务最长运行 2 小时；定期显示原始记录文件变化，不展示模型私有推理内容。',flush=True)
-            p=command([str(py),str(runner),'--project',str(project),'--mode','write','--timeout','7200','--prompt',str(root/'本次任务.txt'),'--output',str(root/'记录')],env=env,logfile=root/'Codex运行.log',timeout=7380,check=False,watch_paths=[('事件记录',root/'记录/codex-events.jsonl'),('诊断日志',root/'记录/codex-stderr.log')])
+            runner_cmd=[str(py),str(runner),'--project',str(project),'--mode','write','--timeout','7200','--prompt',str(root/'本次任务.txt'),'--output',str(root/'记录')]
+            if selected_model: runner_cmd.extend(['--model',selected_model])
+            p=command(runner_cmd,env=env,logfile=root/'Codex运行.log',timeout=7380,check=False,watch_paths=[('事件记录',root/'记录/codex-events.jsonl'),('诊断日志',root/'记录/codex-stderr.log')])
             info['codex_exit_code']=p.returncode
             meta_path=root/'记录/实验信息.json'
             meta=json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}

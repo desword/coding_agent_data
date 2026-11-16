@@ -120,10 +120,64 @@ class Integration(unittest.TestCase):
      log.write_text(json.dumps(event)+'\n');return types.SimpleNamespace(returncode=rc)
     return types.SimpleNamespace(returncode=0)
    with mock.patch.object(module,'command',side_effect=fake_command),mock.patch.object(module.subprocess,'run',return_value=types.SimpleNamespace(returncode=1)):
-    result=module.codex_connection_check(env,root,cache)
+    result,selected=module.codex_connection_check(env,root,cache)
+   self.assertIsNone(selected)
    self.assertEqual(env['CODEX_HOME'],'/original'); self.assertEqual(env['OPENAI_API_KEY'],'sk-or-v1-fake')
    self.assertEqual(result['CODEX_HOME'],str(cache/'codex官方登录'));self.assertNotIn('OPENAI_API_KEY',result);self.assertNotIn('CODEX_API_KEY',result);self.assertEqual(result['CUSTOM_SENTINEL'],'keep')
    self.assertEqual(sum('--skip-git-repo-check' in argv for argv,_ in calls),2);self.assertTrue(any(argv==['codex','login'] for argv,_ in calls))
+ def test_unsupported_model_uses_catalog_and_pins_successful_model(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp); cache=root/'cache';cache.mkdir(); calls=[]
+   env={'PATH':'/bin','CODEX_HOME':'/auth'}
+   def fake_command(argv,**kwargs):
+    calls.append(argv); assert '--skip-git-repo-check' in argv
+    if '--model' not in argv:
+     event={'type':'turn.failed','error':{'message':"The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account. model_not_found"}};rc=1
+    else:
+     assert argv[argv.index('--model')+1]=='gpt-5.4';event={'type':'turn.completed'};rc=0
+    kwargs['logfile'].write_text(json.dumps(event)+'\n');return types.SimpleNamespace(returncode=rc)
+   with mock.patch.object(module,'command',side_effect=fake_command),mock.patch.object(module,'available_codex_models',return_value=['gpt-5.3-codex','gpt-5.4']):
+    chosen_env,model=module.codex_connection_check(env,root,cache)
+   self.assertEqual(chosen_env,env);self.assertEqual(model,'gpt-5.4');self.assertEqual(len(calls),2)
+ def test_missing_model_catalog_installs_private_cli(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp);cache=root/'cache';cache.mkdir();env={'PATH':'/bin','CODEX_HOME':'/existing'}; calls=[]
+   def fake_command(argv,**kwargs):
+    calls.append(argv)
+    if argv[0]=='npm':
+     executable(cache/'codex新版/node_modules/.bin/codex','#!/bin/sh\nexit 0\n');return types.SimpleNamespace(returncode=0)
+    if len([x for x in calls if '--skip-git-repo-check' in x])==1:
+     event={'type':'turn.failed','error':{'message':"model_not_found: The 'gpt-5.3-codex' model is not supported when using Codex"}};rc=1
+    else: event={'type':'turn.completed'};rc=0
+    kwargs['logfile'].write_text(json.dumps(event)+'\n');return types.SimpleNamespace(returncode=rc)
+   with mock.patch.object(module,'command',side_effect=fake_command),mock.patch.object(module,'available_codex_models',return_value=[]):
+    newenv,model=module.codex_connection_check(env,root,cache)
+   self.assertIsNone(model);self.assertEqual(env['PATH'],'/bin');self.assertEqual(newenv['PATH'].split(os.pathsep)[0],str(cache/'codex新版/node_modules/.bin'));self.assertEqual(newenv['CODEX_HOME'],'/existing')
+   self.assertEqual(sum(argv[0]=='npm' for argv in calls),1)
+ def test_model_catalog_filters_hidden_and_disabled_entries(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   base=pathlib.Path(tmp);bin_dir=base/'bin';bin_dir.mkdir()
+   executable(bin_dir/'codex','''#!/usr/bin/env python3
+import json,sys
+for line in sys.stdin:
+ q=json.loads(line)
+ if q.get('method')=='initialize': print(json.dumps({'id':q['id'],'result':{}}),flush=True)
+ if q.get('method')=='model/list':
+  print(json.dumps({'id':q['id'],'result':{'data':[{'model':'gpt-old','isDefault':True,'hidden':True},{'model':'gpt-unsupported','multiAgentVersion':'disabled'},{'model':'gpt-5.4','isDefault':True},{'model':'gpt-codex','isDefault':False},{'model':'invalid model'}],'nextCursor':None}}),flush=True)
+''')
+   env=os.environ.copy();env['PATH']=str(bin_dir)+os.pathsep+env['PATH']
+   self.assertEqual(module.available_codex_models(env,seconds=4),['gpt-5.4','gpt-codex'])
+ def test_model_quota_error_stops_without_trying_or_upgrading(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp);cache=root/'cache';cache.mkdir();calls=[]
+   def fake_command(argv,**kwargs):
+    calls.append(argv)
+    if len(calls)==1:msg="model_not_found: The 'gpt-5.3-codex' model is not supported when using Codex"
+    else:msg='429 usage limit reached for this account'
+    kwargs['logfile'].write_text(json.dumps({'type':'turn.failed','error':{'message':msg}})+'\n');return types.SimpleNamespace(returncode=1)
+   with mock.patch.object(module,'command',side_effect=fake_command),mock.patch.object(module,'available_codex_models',return_value=['gpt-5.4','gpt-5.5']):
+    with self.assertRaises(module.SetupError) as error:module.codex_connection_check({'PATH':'/bin'},root,cache)
+   self.assertIn('429 usage limit',str(error.exception));self.assertEqual(len(calls),2);self.assertFalse(any(x[0]=='npm' for x in calls))
  def test_non_auth_connection_error_does_not_force_login(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=pathlib.Path(tmp);cache=root/'cache';cache.mkdir()
@@ -176,7 +230,17 @@ elif 'rev-parse' in args:
 import json,os,pathlib,sys
 if len(sys.argv)>1 and sys.argv[1]=='login': sys.exit(0)
 if '--version' in sys.argv: print('codex-cli fake');sys.exit(0)
-if '--skip-git-repo-check' in sys.argv: print(json.dumps({'type':'turn.completed'}));sys.exit(0)
+if len(sys.argv)>1 and sys.argv[1]=='app-server':
+ for line in sys.stdin:
+  req=json.loads(line)
+  if req.get('method')=='initialize': print(json.dumps({'id':req['id'],'result':{}}),flush=True)
+  if req.get('method')=='model/list':
+   print(json.dumps({'id':req['id'],'result':{'data':[{'model':'gpt-5.3-codex','isDefault':True},{'model':'gpt-5.4','isDefault':False}],'nextCursor':None}}),flush=True)
+ sys.exit(0)
+if '--skip-git-repo-check' in sys.argv:
+ if '--model' not in sys.argv: print(json.dumps({'type':'turn.failed','error':{'message':"model_not_found: The 'gpt-5.3-codex' model is not supported when using Codex"}}));sys.exit(1)
+ assert sys.argv[sys.argv.index('--model')+1]=='gpt-5.4'; print(json.dumps({'type':'turn.completed'}));sys.exit(0)
+assert '--model' in sys.argv and sys.argv[sys.argv.index('--model')+1]=='gpt-5.4'
 assert any('mcp_servers.mobile-mcp.command=' in arg for arg in sys.argv)
 assert 'sandbox_workspace_write.network_access=true' in sys.argv
 p=pathlib.Path(os.environ['CODEX_HOME'])/'sessions';p.mkdir(parents=True,exist_ok=True)
@@ -201,6 +265,7 @@ print('2026-01-01T00:00:00.030Z codex_otel.agent_communication: communication_id
    with mock.patch.dict(os.environ,env,clear=False),mock.patch.object(module,'command',side_effect=wrapped),mock.patch.object(module.os,'uname',return_value=type('U',(),{'machine':'x86_64'})()):
     self.assertEqual(module.main(),0)
    out=next((home/'codex-agent-experiments').glob('android01-*')); info=json.loads((out/'实验状态.json').read_text());
+   self.assertEqual(info['model_selection'],'gpt-5.4')
    self.assertIn('formal_elapsed_seconds',info); self.assertNotIn('phases',info)
    self.assertIn('正式开发耗时',(out/'实验报告.html').read_text())
    self.assertNotIn('检查工具与登录',(out/'实验报告.html').read_text())
