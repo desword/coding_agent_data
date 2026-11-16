@@ -1,5 +1,7 @@
 # Codex 多 Agent 通信实验
 
+Android 真实应用实验：[候选应用与优先级](android实验/候选应用与优先级.md)；首个案例 [Now in Android 一键测试](android实验/01-NowInAndroid/README.md)。该案例预设项目与任务，无需选择项目。真实端到端结果待实测。
+
 ## 双击开始
 
 在 Mac 上下载 [一键启动多Agent实验.command](一键启动多Agent实验.command)，双击打开，然后按窗口提示完成登录、选择 Git 项目并开始测试。只下载这一个文件即可，首次运行需要联网安装所需组件。
