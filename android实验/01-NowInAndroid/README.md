@@ -1,10 +1,10 @@
 # 01：Now in Android 多 Agent 测试
 
-双击 [一键测试.command](一键测试.command) 启动；不需要选择项目。脚本固定下载 Google 的 [Now in Android](https://github.com/android/nowinandroid) 和公开的 [Android Bug Priority Tree](https://github.com/ChrisThoma/android-bug-priority-tree) 流程，构建应用并启动两个独立 Android 模拟器，再让 Codex Leader 分派真实的设备测试、问题确认、修复及验证任务。应用与公开流程的组合、两台设备和任务分工是本实验配置；不能说公开项目已经验证过这个组合，也不能假定 Codex 一定会遵守所有分工。
+双击 [一键启动多Agent实验.command](../../一键启动多Agent实验.command) 启动；不需要选择项目。脚本固定下载 Google 的 [Now in Android](https://github.com/android/nowinandroid) 和公开的 [Android Bug Priority Tree](https://github.com/ChrisThoma/android-bug-priority-tree) 流程，构建应用并启动两个独立 Android 模拟器，再让 Codex Leader 分派真实的设备测试、问题确认、修复及验证任务。应用与公开流程的组合、两台设备和任务分工是本实验配置；不能说公开项目已经验证过这个组合，也不能假定 Codex 一定会遵守所有分工。
 
 ## 运行前
 
-- macOS 可直接双击；Linux 可执行 `python3 一键测试.command`。需要联网、Git、Python 3.9+、JDK 21+ 和 Node.js 20+（包含 npm）。若没有 Codex CLI，脚本会在本次实验目录中安装；未登录时按屏幕提示登录。使用有相应模型权限的账号，运行可能产生模型使用费用。
+- macOS 可直接双击；Linux 可执行 `python3 一键启动多Agent实验.command`。需要联网、Git、Python 3.9+、JDK 21+ 和 Node.js 20+（包含 npm）。若没有 Codex CLI，脚本会在本次实验目录中安装；未登录时按屏幕提示登录。使用有相应模型权限的账号，运行可能产生模型使用费用。
 - 先安装 Android Studio 和 Android SDK，并在 SDK Manager 安装 Android SDK Platform-Tools、Android Emulator、Android SDK Command-line Tools (latest)。设置 `ANDROID_HOME` 或 `ANDROID_SDK_ROOT`；macOS 和 Linux 常用默认路径会自动识别。
 - 计算机需要能够启动 **两台**启用了硬件加速的 Android 模拟器，并有足够内存与磁盘空间。首次运行可能下载多个 GB：脚本会安装 API 36 平台和 API 34 Google APIs 系统镜像，出现 SDK 许可协议时按窗口提示操作。截图缩放依赖 macOS 自带 `sips` 或 Linux 的 ImageMagick `magick`。
 - 首次构建、设备测试和 Agent 开发可能耗时较长。Agent 阶段最多运行两小时。请保持窗口打开；按 Ctrl+C 中断。

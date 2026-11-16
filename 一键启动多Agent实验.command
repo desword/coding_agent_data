@@ -1,398 +1,333 @@
-#!/bin/bash
-# 双击运行。测试实现随脚本附带，无需下载其他项目文件。
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
-set -u
-TEMP_DIR=""
-finish() {
-  [ -z "$TEMP_DIR" ] || rm -rf "$TEMP_DIR"
-  echo
-  read -r -p '按回车关闭窗口…' _ || true
-}
-trap finish EXIT
-fail() { echo; echo "无法继续：$1"; exit 1; }
-
-echo '===== Codex 多 Agent 一键实验 ====='
-echo '将引导你选择项目、检查登录并开始测试。'
-echo
-command -v git >/dev/null 2>&1 || fail '未找到 Git。请先安装 macOS 命令行开发工具，再重新双击。'
-if ! command -v python3 >/dev/null 2>&1; then
-  echo '需要 Python 3.9 或更新版本。将打开 Python 下载页面；安装后重新双击本文件。'
-  command -v open >/dev/null 2>&1 && open 'https://www.python.org/downloads/macos/'
-  exit 1
-fi
-python3 -c 'import sys; sys.exit(sys.version_info < (3,9))' || fail 'Python 版本过旧，请安装 Python 3.9 或更新版本。'
-
-DATA_DIR="$HOME/Library/Application Support/Codex多Agent实验"
-mkdir -p "$DATA_DIR" || fail '无法创建实验工具目录。'
-export PATH="$DATA_DIR/node/bin:$PATH"
-if ! command -v codex >/dev/null 2>&1; then
-  echo '未找到 Codex CLI。将尝试通过 npm 安装到当前用户的实验工具目录。'
-  if ! command -v npm >/dev/null 2>&1; then
-    echo '需要先安装 Node.js（含 npm）。将打开 Node.js 下载页面；安装后重新双击本文件。'
-    command -v open >/dev/null 2>&1 && open 'https://nodejs.org/en/download'
-    exit 1
-  fi
-  npm install --prefix "$DATA_DIR/node" @openai/codex || fail 'Codex 安装失败，请检查网络及 npm 后重新运行。'
-  command -v codex >/dev/null 2>&1 || fail '安装后仍找不到 codex。'
-fi
-
-echo '正在检查 Codex 登录状态…'
-if ! codex login status; then
-  echo '请按照 Codex 的提示在浏览器完成登录；不会要求你在本工具中输入或保存密钥。'
-  codex login || fail '登录未完成，请检查终端提示后重试。'
-  codex login status || fail '未能确认登录状态，请检查 Codex 配置。'
-fi
-
-echo
-echo '请选择用于测试的 Git 项目文件夹。'
-if command -v osascript >/dev/null 2>&1; then
-  PROJECT=$(osascript -e 'POSIX path of (choose folder with prompt "选择要进行多 Agent 测试的 Git 项目")') || fail '未选择项目。'
-else
-  read -r -p '请输入 Git 项目路径：' PROJECT || fail '未输入项目。'
-fi
-[ -d "$PROJECT" ] || fail '项目目录不存在。'
-git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail '所选目录不是 Git 项目。'
-
-echo
-echo '选择测试方式：'
-echo '  1. 只读分析（推荐，不修改项目）'
-echo '  2. 开发任务（允许修改所选项目，请使用项目副本）'
-read -r -p '输入 1 或 2，直接回车选择 1：' CHOICE || fail '无法读取选择。'
-case "$CHOICE" in
-  ''|1) MODE=readonly; TIMEOUT=1800 ;;
-  2) MODE=write; TIMEOUT=3600 ;;
-  *) fail '请选择 1 或 2。' ;;
-esac
-
-echo '正在准备报告组件，首次运行需要联网，可能需要几分钟…'
-if [ ! -x "$DATA_DIR/venv/bin/python" ]; then
-  python3 -m venv "$DATA_DIR/venv" || fail '无法创建 Python 环境，请检查 Python venv 组件。'
-fi
-if ! "$DATA_DIR/venv/bin/python" -c 'import docx' >/dev/null 2>&1; then
-  "$DATA_DIR/venv/bin/python" -m pip install 'python-docx>=1.1,<2' || fail '报告组件安装失败，请检查网络后重试。'
-fi
-TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/codex-agent-kit.XXXXXXXX") || fail '无法创建临时目录。'
-awk 'found {print} /^# __PYTHON_PAYLOAD__$/ {found=1}' "$0" > "$TEMP_DIR/agent_experiment.py" || fail '无法读取脚本内容。'
-cat > "$TEMP_DIR/smoke.txt" <<'PROMPT'
-请明确使用多智能体并行完成本次只读分析。启动 3 个子 Agent：A 分析当前 Git 项目的主要目录和功能模块；B 分析如何安装依赖、运行项目及测试；C 寻找模块之间的关键接口及可能的集成风险。所有子 Agent 不修改文件、不安装依赖、不执行会改变项目的命令。由主 Agent 等待并综合它们的结果，列出各自负责内容，并给出适合后续多人并行开发的一个功能建议。
-PROMPT
-cat > "$TEMP_DIR/development.txt" <<'PROMPT'
-请使用多个子 Agent 协作，为当前项目增加一个与现有项目实际功能相符的小型功能。先检查项目结构和现有规范，选择可以涉及两个代码模块和测试的合理需求，然后再实施。主 Agent 负责协调需求、接口、集成测试以及问题修复；至少启动三个子 Agent 分别负责不同模块的实现、相关测试或只读审查，按实际项目结构划分任务，并避免同时修改同一文件。让相关 Agent 汇报接口定义、修改文件与测试结果；出现错误时协调定位和修复。最后给出变更、测试结果、未解决问题。不得推送、发布、删除仓库数据或修改凭据。
-PROMPT
-if [ "$MODE" = readonly ]; then PROMPT_FILE="$TEMP_DIR/smoke.txt"; else PROMPT_FILE="$TEMP_DIR/development.txt"; fi
-mkdir -p "$HOME/codex-agent-experiments" || fail '无法创建结果目录。'
-OUTPUT=$(mktemp -d "$HOME/codex-agent-experiments/experiment-XXXXXXXX") || fail '无法创建结果目录。'
-rmdir "$OUTPUT" || fail '无法准备结果目录。'
-echo
-echo "开始测试，结果目录：$OUTPUT"
-echo '运行可能需要较长时间，完成前请不要关闭此窗口。'
-"$DATA_DIR/venv/bin/python" "$TEMP_DIR/agent_experiment.py" --project "$PROJECT" --mode "$MODE" --prompt "$PROMPT_FILE" --timeout "$TIMEOUT" --output "$OUTPUT"
-RESULT=$?
-echo
-if [ "$RESULT" -eq 0 ]; then
-  echo '程序运行结束。请打开 实验统计报告.docx，确认关联到子 Agent 会话且识别到消息。'
-else
-  echo "测试未正常完成（退出码 $RESULT）。请查看结果目录中的 codex-stderr.log 和 实验信息.json。"
-fi
-if [ -d "$OUTPUT" ] && command -v open >/dev/null 2>&1; then open "$OUTPUT" || true; fi
-exit "$RESULT"
-# __PYTHON_PAYLOAD__
 #!/usr/bin/env python3
-"""Run local Codex and conservatively extract observable collaboration records."""
+"""Standalone Android/Codex experiment. Run by double-click or python3."""
 from __future__ import annotations
-import argparse, collections, csv, datetime as dt, json, os, pathlib, re, shutil, signal, subprocess, sys, threading, time
-from typing import Any
+import base64, collections, contextlib, csv, datetime as dt, html, json, math, os, pathlib, re, shutil, signal, socket, statistics, subprocess, sys, tempfile, threading, time, urllib.parse, webbrowser, zlib
 
-HERE = pathlib.Path(__file__).resolve().parent
-OUT_FIELDS = ['时间','发送方','接收方','事件','消息内容','UTF8字节','状态','来源文件','行号','说明']
-COLLAB = {'spawn_agent','send_message','send_input','followup_task','wait_agent','wait','close_agent','interrupt_agent','list_agents'}
-SEND = {'spawn_agent','send_message','send_input','followup_task'}
+APP_URL = 'https://github.com/android/nowinandroid.git'
+APP_REV = 'a49ed253d75e61a2b6ab80a8da677b57437b08eb'
+FLOW_URL = 'https://github.com/ChrisThoma/android-bug-priority-tree.git'
+FLOW_REV = '3c473b9c3e7620df2fc4ee830921e8512036416a'
+APP_ID = 'com.google.samples.apps.nowinandroid.demo.debug'
+RUNNER = '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'
 
-def json_obj(v: Any) -> Any:
-    if isinstance(v, str):
-        try: return json.loads(v)
-        except (ValueError, TypeError): return v
-    return v
+class SetupError(Exception): pass
 
-def lines(path):
-    try:
-        with path.open(encoding='utf-8') as f:
-            for n, line in enumerate(f, 1):
-                try:
-                    v=json.loads(line)
-                    if isinstance(v, dict): yield n,v
-                except (ValueError, UnicodeError): continue
-    except (OSError, UnicodeError): return
+def command(argv, *, cwd=None, env=None, logfile=None, timeout=None, stdin=None, interactive=False):
+    print('\n$', ' '.join(str(x) for x in argv), flush=True)
+    if interactive:
+        p = subprocess.run(argv, cwd=cwd, env=env, timeout=timeout, input=stdin, text=True)
+    else:
+        with open(logfile, 'a', encoding='utf-8') as log:
+            log.write('\n$ ' + ' '.join(map(str, argv)) + '\n'); log.flush()
+            p = subprocess.run(argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout, input=stdin, text=True)
+    if p.returncode:
+        raise SetupError(f'{argv[0]} 返回 {p.returncode}' + (f'，详情见 {logfile}' if logfile else ''))
+    return p
 
-def meta(path):
-    for _, obj in lines(path):
-        if obj.get('type')=='session_meta':
-            p=obj.get('payload') or {}; src=p.get('source') or {}
-            if not isinstance(src,dict): src={}
-            sub=src.get('subagent') or {}; sub=sub if isinstance(sub,dict) else {}
-            spawn=sub.get('thread_spawn') or {}; spawn=spawn if isinstance(spawn,dict) else {}
-            return {'id':str(p.get('id') or ''), 'parent':str(spawn.get('parent_thread_id') or p.get('parent_thread_id') or ''), 'name':str(spawn.get('agent_path') or ''), 'path':path}
-    return None
+def locate_sdk():
+    candidates = [os.environ.get('ANDROID_SDK_ROOT'), os.environ.get('ANDROID_HOME'), str(pathlib.Path.home()/'Library/Android/sdk'), str(pathlib.Path.home()/'Android/Sdk')]
+    for x in candidates:
+        if x and pathlib.Path(x).is_dir(): return pathlib.Path(x).expanduser().resolve()
+    raise SetupError('未找到 Android SDK。请安装 Android Studio、SDK 和 Command-line Tools 后重新运行；不要在聊天中提供密钥。')
 
-def collect_sessions(home, outdir, root_id, start):
-    dest=outdir/'sessions'; dest.mkdir(exist_ok=True)
-    if not root_id: return [], '事件流中没有 root thread ID，未复制会话文件。'
-    base=home/'sessions'; found={}
-    if not base.exists(): return [], f'未找到会话目录：{base}'
-    for p in base.rglob('*.jsonl'):
+def tool(sdk, *paths):
+    for path in paths:
+        p = sdk/path
+        if p.is_file() and os.access(p, os.X_OK): return str(p)
+    raise SetupError(f'Android SDK 缺少 {paths[0]}；请在 Android Studio 的 SDK Manager 安装对应组件。')
+
+def java21():
+    env = os.environ.copy()
+    if sys.platform == 'darwin' and pathlib.Path('/usr/libexec/java_home').exists():
+        p = subprocess.run(['/usr/libexec/java_home','-v','21'], capture_output=True, text=True)
+        if p.returncode == 0 and p.stdout.strip():
+            env['JAVA_HOME'] = p.stdout.strip(); env['PATH'] = str(pathlib.Path(env['JAVA_HOME'])/'bin') + os.pathsep + env.get('PATH','')
+    java = shutil.which('java', path=env.get('PATH'))
+    if not java: raise SetupError('未找到 JDK 21；请安装后重试。')
+    p = subprocess.run([java, '-version'],capture_output=True,text=True)
+    match = re.search(r'version "(\d+)', p.stderr + p.stdout)
+    if p.returncode or not match or int(match.group(1)) < 21: raise SetupError('需要 JDK 21 或更高版本。')
+    return env
+
+def ports(count):
+    # Probe both emulator console and adb port; the emulator itself performs the final bind.
+    answer=[]
+    for p in range(5554, 5680, 2):
+        sockets=[]
         try:
-            if p.stat().st_mtime < start-300: continue
-            m=meta(p)
-            if m and m['id']: found[m['id']]=m
+            for n in (p,p+1):
+                s=socket.socket(); sockets.append(s); s.bind(('127.0.0.1',n))
+            answer.append(p)
         except OSError: pass
-    selected={root_id} if root_id in found else set()
-    while True:
-        expanded=selected | {i for i,m in found.items() if m['parent'] in selected}
-        if expanded==selected: break
-        selected=expanded
-    result=[]
-    for i in sorted(selected):
-        m=found[i]; target=dest/(re.sub(r'[^a-zA-Z0-9_-]','_',i)+'.jsonl')
-        shutil.copy2(m['path'],target); m=dict(m); m['path']=target; result.append(m)
-    return result, ('已按 root ID 和父子 ID 关联会话。' if root_id in found else '未找到 root 的会话记录；未按时间猜测归属。')
+        finally:
+            for s in sockets: s.close()
+        if len(answer)==count: return answer
+    raise SetupError('找不到两个空闲模拟器端口。')
 
-def csvsafe(v):
-    s=str(v or '')
-    return "'"+s if s.lstrip().startswith(('=','+','-','@')) else s
+def booted(adb, serial, env, proc, seconds=360):
+    end=time.monotonic()+seconds
+    while time.monotonic()<end:
+        if proc.poll() is not None: raise SetupError(f'{serial} 模拟器提前退出，请查看其日志。')
+        p=subprocess.run([adb,'-s',serial,'shell','getprop','sys.boot_completed'],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,timeout=10)
+        if p.returncode==0 and p.stdout.strip()=='1': return
+        time.sleep(3)
+    raise SetupError(f'{serial} 在 {seconds} 秒内未完成启动。')
 
-def sample_processes(pid, path, stop):
-    """Sample root process and descendants; not a per-agent attribution."""
-    with path.open('w',encoding='utf-8',newline='') as f:
-        w=csv.writer(f); w.writerow(['timestamp_utc','pid','ppid','cpu_percent','rss_kib','command'])
-        while not stop.is_set():
-            try:
-                result=subprocess.run(['ps','-axo','pid=,ppid=,%cpu=,rss=,comm='],capture_output=True,text=True,timeout=5)
-                processes={}
-                for ln in result.stdout.splitlines():
-                    parts=ln.strip().split(None,4)
-                    if len(parts)==5 and parts[0].isdigit() and parts[1].isdigit(): processes[int(parts[0])]=parts
-                selected={pid}
-                while True:
-                    more=selected | {p for p,v in processes.items() if int(v[1]) in selected}
-                    if selected==more: break
-                    selected=more
-                now=dt.datetime.now(dt.timezone.utc).isoformat()
-                for p in sorted(selected):
-                    if p in processes: w.writerow([now,*processes[p]])
-                f.flush()
-            except (OSError,subprocess.SubprocessError): pass
-            stop.wait(2)
-
-def resource_stats(path):
-    groups=collections.defaultdict(lambda:[0,0.0,0])
+def timestamp(value):
     try:
-        with path.open(encoding='utf-8',newline='') as f:
-            for r in csv.DictReader(f):
-                g=groups[r['timestamp_utc']]; g[0]+=1; g[1]+=float(r['cpu_percent']); g[2]+=int(r['rss_kib'])
-    except (OSError,KeyError,ValueError): return {}
-    if not groups: return {}
-    return {'sample_times':len(groups),'max_visible_processes':max(v[0] for v in groups.values()),'max_cpu_percent_sum':round(max(v[1] for v in groups.values()),1),'max_rss_kib_sum':max(v[2] for v in groups.values())}
+        d=dt.datetime.fromisoformat(value.replace('Z','+00:00'))
+        return d if d.tzinfo else None
+    except (ValueError,TypeError,AttributeError): return None
 
-def parse_sessions(sessions,root_id):
-    rows=[]; diagnostics=[]
-    names={m['id']:(m['name'] or ('/root' if m['id']==root_id else m['id'])) for m in sessions}
-    for m in sessions:
-        owner=names.get(m['id'],m['id']); calls={}; payloads=[]
-        for n,obj in lines(m['path']):
-            p=obj.get('payload');
-            if obj.get('type')!='response_item' or not isinstance(p,dict): continue
-            kind=p.get('type'); name=str(p.get('name') or '').split('.')[-1]
-            if kind in ('function_call','custom_tool_call') and name in COLLAB:
-                args=json_obj(p.get('arguments') or p.get('input') or {})
-                if not isinstance(args,dict): args={}
-                callid=str(p.get('call_id') or p.get('id') or '')
-                if callid: calls[callid]=(name,args,n,obj.get('timestamp',''))
-                if name in SEND:
-                    content=args.get('message') or args.get('prompt') or args.get('text') or ''
-                    target=args.get('target') or args.get('agent_id') or args.get('task_name') or args.get('recipient') or ''
-                    if isinstance(content,str) and content:
-                        rows.append({'时间':obj.get('timestamp',''),'发送方':owner,'接收方':str(target) or '未知','事件':name,'消息内容':content,'UTF8字节':len(content.encode('utf-8')),'状态':'调用记录，送达待核对','来源文件':m['path'].name,'行号':n,'说明':'按工具参数提取消息正文；工具调用不等于确认送达。'})
-                    else:
-                        diagnostics.append(f"{m['path'].name}:{n} {name} 未能读取明文消息参数")
-            elif kind in ('function_call_output','custom_tool_call_output'):
-                cid=str(p.get('call_id') or '')
-                if cid in calls: payloads.append((n,obj,calls[cid]))
-        for n,obj,(tool,args,call_line,ts) in payloads:
-            if tool not in ('wait_agent','wait','close_agent'): continue
-            p=obj['payload']; raw=p.get('output'); v=json_obj(raw)
-            # Only count a result with an explicit completed status and string content.
-            if isinstance(v,dict):
-                statuses=v.get('status') or v.get('statuses') or {}
-                if isinstance(statuses,dict):
-                    for sender, state in statuses.items():
-                        body=state.get('completed') if isinstance(state,dict) else None
-                        if isinstance(body,str) and body:
-                            rows.append({'时间':obj.get('timestamp',''),'发送方':names.get(str(sender),str(sender)),'接收方':owner,'事件':'已返回结果','消息内容':body,'UTF8字节':len(body.encode('utf-8')),'状态':'等待结果中可见','来源文件':m['path'].name,'行号':n,'说明':'仅统计明确 completed 文本；与子会话的重复通知不再累加。'})
-    rows.sort(key=lambda r:(str(r['时间']),str(r['来源文件']),int(r['行号'])))
-    return rows,diagnostics
+def parse_telemetry(path):
+    """Conservative parser: only send/receive with the same explicit communication_id."""
+    ansi=re.compile(r'\x1b\[[0-9;]*m'); records=collections.defaultdict(lambda: {'send': [], 'receive': []})
+    if not path.exists(): return []
+    def val(line,key):
+        m=re.search(r'\b'+re.escape(key)+r'\s*[=:]\s*(?:"([^"\n]*)"|([^\s,}\]]+))',line)
+        return (m.group(1) or m.group(2)) if m else ''
+    for n,raw in enumerate(path.read_text(encoding='utf-8',errors='replace').splitlines(),1):
+        line=ansi.sub('',raw)
+        if 'agent_communication' not in line: continue
+        cid=val(line,'communication_id'); state=val(line,'state')
+        t=re.search(r'\b\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)',line)
+        if cid and state in ('send','receive'):
+            records[cid][state].append({'time':t.group(0) if t else '', 'line':n, 'sender':val(line,'sender_thread_id'),'receiver':val(line,'receiver_thread_id'),'kind':val(line,'kind')})
+    result=[]
+    for cid,pair in records.items():
+        a=pair['send']; b=pair['receive']; status='ok'; ms=''
+        if len(a)!=1 or len(b)!=1: status='missing_or_duplicate_event'
+        else:
+            ta=timestamp(a[0]['time']); tb=timestamp(b[0]['time'])
+            if ta is None or tb is None or tb<ta: status='invalid_timestamp'
+            else: ms=round((tb-ta).total_seconds()*1000,3)
+        one=a[0] if a else {}; two=b[0] if b else {}
+        result.append({'communication_id':cid,'kind':one.get('kind',''),'sender_thread_id':one.get('sender',''),'receiver_thread_id':one.get('receiver',''),'send_utc':one.get('time',''),'receive_utc':two.get('time',''),'delivery_ms':ms,'status':status,'send_line':one.get('line',''),'receive_line':two.get('line','')})
+    return result
 
-def parse_latencies(sessions):
-    """Pair tool calls and outputs within one session, never across sessions."""
-    rows=[]
-    for session in sessions:
-        calls={}
-        for number, obj in lines(session['path']):
-            p=obj.get('payload')
-            if obj.get('type')!='response_item' or not isinstance(p,dict): continue
-            kind=p.get('type'); cid=str(p.get('call_id') or p.get('id') or '')
-            name=str(p.get('name') or '').split('.')[-1]
-            if kind in ('function_call','custom_tool_call') and name in COLLAB and cid:
-                calls[cid]=(name,obj.get('timestamp',''),number)
-            elif kind in ('function_call_output','custom_tool_call_output') and cid in calls:
-                tool,started,start_line=calls.pop(cid)
-                ended=obj.get('timestamp',''); duration=''; status='ok'
-                try:
-                    a=dt.datetime.fromisoformat(started.replace('Z','+00:00'))
-                    b=dt.datetime.fromisoformat(ended.replace('Z','+00:00'))
-                    if a.tzinfo is None or b.tzinfo is None: raise ValueError('timezone missing')
-                    seconds=(b-a).total_seconds()
-                    if seconds < 0: raise ValueError('negative duration')
-                    duration=round(seconds*1000,3)
-                except (ValueError,TypeError,AttributeError): status='invalid_timestamp'
-                rows.append({'session_id':session['id'],'tool':tool,'call_id':cid,'started_utc':started,'ended_utc':ended,'duration_ms':duration,'measurement_status':status,'source_file':session['path'].name,'call_line':start_line,'output_line':number})
-        for cid,(tool,started,start_line) in calls.items():
-            rows.append({'session_id':session['id'],'tool':tool,'call_id':cid,'started_utc':started,'ended_utc':'','duration_ms':'','measurement_status':'missing_output','source_file':session['path'].name,'call_line':start_line,'output_line':''})
-    return rows
-
-def create_docx(path, manifest, rows, diagnostics):
-    from docx import Document
-    from docx.shared import Pt, Inches, RGBColor
-    from docx.oxml.ns import qn
-    from docx.enum.text import WD_BREAK
-    d=Document(); sec=d.sections[0]; sec.top_margin=Inches(.7); sec.bottom_margin=Inches(.7)
-    style=d.styles['Normal']; style.font.name='Microsoft YaHei'; style.font.size=Pt(10.5); style._element.rPr.rFonts.set(qn('w:eastAsia'),'Microsoft YaHei')
-    for style_name in ('Title','Heading 1','Heading 2'):
-        s=d.styles[style_name]; s.font.name='Microsoft YaHei'; s.font.color.rgb=RGBColor(0,0,0); s._element.get_or_add_rPr().get_or_add_rFonts().set(qn('w:eastAsia'),'Microsoft YaHei')
-    title_style=d.styles['Title']._element
-    for border in title_style.xpath('./w:pPr/w:pBdr'):
-        border.getparent().remove(border)
-    d.add_heading('Codex 多智能体通信实验报告',0)
-    d.add_paragraph('实验运行：'+manifest.get('run_id','未提供'))
-    d.add_heading('一 实验结论与采集状态',level=1)
-    n_agents=manifest.get('session_count',0); count=len(rows); size=sum(int(x['UTF8字节']) for x in rows)
-    d.add_paragraph(f'关联到 {n_agents} 个会话文件；提取到 {count} 条可识别的协作消息正文，共 {size:,} UTF-8 字节。该结果仅覆盖本版本解析器识别到的记录，完整性尚需人工核对。')
-    d.add_paragraph('子 Agent 会话数为 '+str(max(0,n_agents-1))+'；会话数不代表独立进程或容器数。')
-    if not rows: d.add_paragraph('本次没有提取到可识别消息。请检查 root 会话是否保存、是否实际调用了子 Agent、原始字段是否变化；不能据此判断真实消息量为零。')
-    d.add_paragraph('采集状态：'+manifest.get('session_note','未提供'))
-    d.add_paragraph('Codex 退出状态：'+str(manifest.get('exit_code','未提供'))+'；超时：'+str(manifest.get('timed_out',False)))
-    d.add_paragraph('运行时进程采样见进程资源.csv；采样对象是 Codex 进程及可见子进程，不能归因为每个 Agent，采样值也不包含不可见的容器或远端模型服务。')
-    d.add_paragraph('调用耗时.csv 按同一会话内的工具调用 ID 配对时间戳；可计算的调用数：'+str(manifest.get('latency_paired_calls',0))+'。耗时包括工具执行和等待，不代表网络或消息传输延迟；缺失或无效时间戳不计为零。')
-    rs=manifest.get('resources') or {}
-    if rs:
-        d.add_paragraph(f"采样 {rs['sample_times']} 次；最多同时观察到 {rs['max_visible_processes']} 个进程；进程 CPU% 总和峰值 {rs['max_cpu_percent_sum']}%，RSS 总和峰值约 {rs['max_rss_kib_sum']/1024:.1f} MiB。RSS 相加可能重复计算共享内存。")
-    else: d.add_paragraph('本次没有可用的进程资源采样。')
-    d.add_heading('二 消息类型统计',level=1)
-    sums=collections.defaultdict(lambda:[0,0])
-    for row in rows: sums[row['事件']][0]+=1; sums[row['事件']][1]+=row['UTF8字节']
-    if sums:
-        table=d.add_table(rows=1,cols=3); table.style='Light Shading Accent 1'
-        for cell,text in zip(table.rows[0].cells,['事件','条数','正文 UTF-8 字节']): cell.text=text
-        for k,(n,b) in sorted(sums.items()):
-            for cell,text in zip(table.add_row().cells,[str(k),str(n),f'{b:,}']): cell.text=text
-    else: d.add_paragraph('没有符合当前提取规则的记录。')
-    d.add_heading('三 消息明细摘录',level=1)
-    if not rows: d.add_paragraph('无。')
-    for i,r in enumerate(rows[:30],1):
-        d.add_paragraph(f"{i}. {r['发送方']} → {r['接收方']}  |  {r['事件']}  |  {r['UTF8字节']} 字节",style='Heading 2')
-        safe_text=re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', r['消息内容'])
-        body=d.add_paragraph(safe_text[:600]+('…（完整内容见 CSV）' if len(safe_text)>600 else ''))
-        body.paragraph_format.keep_with_next=True
-        d.add_paragraph(f"来源：{r['来源文件']} 第 {r['行号']} 行；{r['状态']}。")
-    if len(rows)>30: d.add_paragraph(f'报告展示前 30 条，共 {len(rows)} 条；完整明细见消息明细.csv。')
-    d.add_heading('四 口径与核对',level=1)
-    d.add_paragraph('任务下发按协作工具的明文参数提取。调用记录不保证成功送达；无法解析收件人时显示未知。')
-    d.add_paragraph('结果返回只统计等待工具输出中明确标记完成的文本。子会话终态、通知和公开事件流不叠加计数；其他格式可能漏计。')
-    d.add_paragraph('字节数为消息正文的 UTF-8 编码长度，不等于网络字节数。读取文件、模型请求、继承上下文和协议开销均未包含。')
-    d.add_paragraph('事件用途按工具类型初分；具体消息目的需要人工阅读。')
-    if diagnostics:
-        d.add_paragraph('待核对记录：'+str(len(diagnostics))+' 条。示例：'+'；'.join(diagnostics[:3]))
-    d.save(path)
-
-def analyze(outdir,manifest,sessions):
-    rows,diag=parse_sessions(sessions,manifest.get('root_thread_id',''))
-    latency=parse_latencies(sessions)
-    with (outdir/'调用耗时.csv').open('w',encoding='utf-8-sig',newline='') as f:
-        fields=['session_id','tool','call_id','started_utc','ended_utc','duration_ms','measurement_status','source_file','call_line','output_line']
+def write_csv(path,fields,rows):
+    with path.open('w',encoding='utf-8-sig',newline='') as f:
         w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
-        for row in latency: w.writerow({k:(csvsafe(v) if isinstance(v,str) else v) for k,v in row.items()})
-    manifest['latency_paired_calls']=sum(r['measurement_status']=='ok' for r in latency)
-    manifest['resources']=resource_stats(outdir/'进程资源.csv')
-    with (outdir/'消息明细.csv').open('w',encoding='utf-8-sig',newline='') as f:
-        w=csv.DictWriter(f,fieldnames=OUT_FIELDS); w.writeheader()
-        for row in rows: w.writerow({k:(csvsafe(v) if isinstance(v,str) else v) for k,v in row.items()})
-    (outdir/'待核对.txt').write_text('\n'.join(diag) or '无解析器诊断。请仍抽查原始会话记录。',encoding='utf-8')
-    manifest['recognized_messages']=len(rows); manifest['recognized_body_bytes']=sum(x['UTF8字节'] for x in rows); manifest['diagnostics']=len(diag)
-    (outdir/'实验信息.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
-    create_docx(outdir/'实验统计报告.docx',manifest,rows,diag)
-    return rows
+        for row in rows:
+            w.writerow({k:("'"+v if isinstance(v,str) and v.lstrip().startswith(('=','+','-','@')) else v) for k,v in row.items()})
+
+def stats(values):
+    values=sorted(values)
+    if not values: return '无可配对样本'
+    percentile=lambda p: values[max(0,math.ceil(len(values)*p)-1)]
+    result=f'样本 {len(values)}，中位数 {statistics.median(values):.3f} ms，最大 {values[-1]:.3f} ms'
+    if len(values)>=20: result+=f'，P95 {percentile(.95):.3f} ms'
+    if len(values)>=100: result+=f'，P99 {percentile(.99):.3f} ms'
+    return result
+
+def report(root, info):
+    event_dir=root/'记录'; diag=[]; counts=collections.defaultdict(lambda:[0,0]); directions=collections.defaultdict(lambda:[0,0]); examples=[]; call_times=collections.defaultdict(list)
+    try:
+        with (event_dir/'消息明细.csv').open(encoding='utf-8-sig',newline='') as f:
+            for row in csv.DictReader(f):
+                key=row.get('事件','未知'); counts[key][0]+=1
+                try:
+                    size=int(row['UTF8字节']); counts[key][1]+=size
+                    sender=row.get('发送方',''); receiver=row.get('接收方','')
+                    if sender=='/root' and receiver not in ('/root','未知',''): direction='Leader → Worker'
+                    elif receiver=='/root' and sender not in ('/root','未知',''): direction='Worker → Leader'
+                    else: direction='方向未知或其他'
+                    directions[direction][0]+=1; directions[direction][1]+=size
+                    if len(examples)<12: examples.append((direction,key,row.get('消息内容','')[:300],row.get('来源文件',''),row.get('行号','')))
+                except (KeyError,ValueError): diag.append('某条消息的字节数不可解析。')
+    except OSError: diag.append('消息明细不存在：未能运行或分析 Codex。')
+    try:
+        with (event_dir/'调用耗时.csv').open(encoding='utf-8-sig',newline='') as f:
+            for row in csv.DictReader(f):
+                if row.get('measurement_status')=='ok':
+                    try: call_times[row['tool']].append(float(row['duration_ms']))
+                    except (KeyError,ValueError): pass
+    except OSError: pass
+    tele=parse_telemetry(event_dir/'codex-stderr.log')
+    fields=['communication_id','kind','sender_thread_id','receiver_thread_id','send_utc','receive_utc','delivery_ms','status','send_line','receive_line']
+    write_csv(root/'投递时间明细.csv',fields,tele)
+    delivery=collections.defaultdict(list)
+    for row in tele:
+        if row['status']=='ok': delivery[row['kind'] or 'unknown'].append(row['delivery_ms'])
+    info['telemetry_events_matched']=sum(len(v) for v in delivery.values())
+    info['recognized_messages_by_tool']={k:{'count':v[0],'body_utf8_bytes':v[1]} for k,v in counts.items()}
+    info['recognized_messages_by_direction']={k:{'count':v[0],'body_utf8_bytes':v[1]} for k,v in directions.items()}
+    (root/'实验状态.json').write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding='utf-8')
+    e=html.escape
+    parts=['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Android 多 Agent 实验报告</title><style>body{font:16px/1.65 -apple-system,BlinkMacSystemFont,sans-serif;max-width:1000px;margin:40px auto;padding:0 20px;color:#1f2937}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;text-align:left}code{background:#f1f5f9;padding:2px 4px}</style><h1>Android 多 Agent 实验报告</h1>']
+    parts.append('<p>运行状态：<b>'+e(str(info.get('status','未知')))+'</b>。 '+e(str(info.get('detail','')))+'</p>')
+    parts.append('<p>应用和基线：Now in Android <code>'+APP_REV+'</code>；公开工作流：Android Bug Priority Tree <code>'+FLOW_REV+'</code>。应用与流程的组合、设备槽位属于本实验配置。</p>')
+    parts.append('<h2>阶段耗时</h2><table><tr><th>阶段</th><th>秒</th><th>状态</th></tr>')
+    for p in info.get('phases',[]): parts.append('<tr><td>'+e(p['name'])+'</td><td>'+str(p['seconds'])+'</td><td>'+e(p['status'])+'</td></tr>')
+    parts.append('</table><h2>可识别消息正文</h2><p>按工具调用参数及支持格式的完成结果提取；调用不保证送达，未识别记录不等于零。明细包含发送方、接收方和来源行。自动通知、继承上下文、日志不支持的格式可能遗漏。</p><table><tr><th>事件</th><th>条数</th><th>正文 UTF-8 字节</th></tr>')
+    for k,(n,b) in sorted(counts.items()): parts.append(f'<tr><td>{e(k)}</td><td>{n}</td><td>{b}</td></tr>')
+    if not counts: parts.append('<tr><td colspan="3">没有可识别记录；不能据此判断真实通信量为零。</td></tr>')
+    parts.append('</table><h3>通信方向与内容摘录</h3><p>仅在会话明确标识 /root 和对端时归类，无法判断的保留为未知；正文 UTF-8 字节不是网络流量字节，不包含协议开销、模型请求、文件内容和共享上下文。</p><table><tr><th>方向</th><th>条数</th><th>正文 UTF-8 字节</th></tr>')
+    for k,(n,b) in sorted(directions.items()): parts.append(f'<tr><td>{e(k)}</td><td>{n}</td><td>{b}</td></tr>')
+    if not directions: parts.append('<tr><td colspan="3">没有可分类的消息。</td></tr>')
+    parts.append('</table><p>下列内容仅为前 12 条可识别记录的截取，具体用途须结合原始上下文人工判断。</p><table><tr><th>方向 / 事件</th><th>消息摘录</th><th>原始记录</th></tr>')
+    for direction,kind,body,source,line in examples: parts.append('<tr><td>'+e(direction+' / '+kind)+'</td><td>'+e(body)+'</td><td>'+e(source+':'+str(line))+'</td></tr>')
+    if not examples: parts.append('<tr><td colspan="3">无可展示消息。</td></tr>')
+    parts.append('</table><h2>延迟拆分</h2><p>以下为同一会话内工具调用到其返回的时间差；wait 是等待工作结果，通常包括 Agent 工作、模型与排队时间。它们不是网络延迟。</p><table><tr><th>工具</th><th>统计</th></tr>')
+    for k,v in sorted(call_times.items()): parts.append('<tr><td>'+e(k)+'</td><td>'+e(stats(v))+'</td></tr>')
+    if not call_times: parts.append('<tr><td colspan="2">无可配对的工具调用时间。</td></tr>')
+    parts.append('</table><h3>发送到接收事件</h3><p>仅在 Codex 的原始诊断中出现同一通信 ID 的唯一 send 和 receive、且时间有效时配对；时间包含本地排队与调度，不等于网络传输或应用端完整处理。日志版本可能不输出这些事件。</p><table><tr><th>类型</th><th>统计</th></tr>')
+    for k,v in sorted(delivery.items()): parts.append('<tr><td>'+e(k)+'</td><td>'+e(stats(v))+'</td></tr>')
+    if not delivery: parts.append('<tr><td colspan="2">当前未获得可配对投递事件，无法判断实际投递耗时。</td></tr>')
+    parts.append('</table><h2>瓶颈判断</h2><p>本报告不会把模型推理时间、Worker 执行时间或 wait 耗时归因于通信。缺少完整投递时间、跨路径对照与足够样本时，无法判断 Leader–Worker 通信是否为主要瓶颈。模拟器资源采样是设备槽位级，不等于 Agent 或远端模型独占资源。</p>')
+    parts.append('<h2>设备与核对</h2><p>本次仅当两个模拟器都启动、安装 APK 并通过非零 Android 测试后才开始 Codex。Agent 使用指定设备仍需逐条核对会话、测试日志与证据，设备启动不证明任务完成。入口、设备数据、失败及未完成内容见实验状态与安装日志。</p>')
+    parts.append('<p>原始会话和报告可能包含源代码、截图或敏感信息。查看 <code>记录/消息明细.csv</code>、<code>记录/调用耗时.csv</code>、<code>投递时间明细.csv</code>、<code>记录/codex-stderr.log</code>、<code>设备资源.csv</code> 及原始会话核对。'+e(' '.join(diag))+'</p></html>')
+    (root/'实验报告.html').write_text('\n'.join(parts),encoding='utf-8')
+
+def sample_devices(procs,path,stop):
+    with path.open('w',encoding='utf-8-sig',newline='') as f:
+        w=csv.writer(f); w.writerow(['utc','slot','pid','cpu_percent','rss_kib'])
+        while not stop.is_set():
+            now=dt.datetime.now(dt.timezone.utc).isoformat()
+            for slot,p in procs:
+                if p.poll() is not None: continue
+                x=subprocess.run(['ps','-p',str(p.pid),'-o','%cpu=,rss='],capture_output=True,text=True)
+                vals=x.stdout.split()
+                if len(vals)>=2: w.writerow([now,slot,p.pid,vals[0],vals[1]])
+            f.flush(); stop.wait(2)
 
 def main():
-    ap=argparse.ArgumentParser(description='Codex 本地多 Agent 通信实验；默认只读分析。')
-    ap.add_argument('--project',default='.',help='目标 Git 项目目录；默认当前目录')
-    ap.add_argument('--prompt',default=str(HERE/'prompts/smoke.txt'),help='任务提示词文本文件')
-    ap.add_argument('--mode',choices=['readonly','write'],default='readonly',help='只读或允许工作区修改')
-    ap.add_argument('--timeout',type=int,default=1800,help='最多等待秒数；默认 1800')
-    ap.add_argument('--model',help='可选 Codex 模型名；不指定时使用现有配置')
-    ap.add_argument('--output',help='本次输出目录；默认 ~/codex-agent-experiments 下新建')
-    ap.add_argument('--analyze',help='重新分析既有运行目录，不再调用 Codex')
-    args=ap.parse_args()
-    if args.analyze:
-        out=pathlib.Path(args.analyze).expanduser().resolve(); manifest=json.loads((out/'实验信息.json').read_text(encoding='utf-8'))
-        sessions=[m for p in (out/'sessions').glob('*.jsonl') if (m:=meta(p))]
-        analyze(out,manifest,sessions); print('已重新生成报告：',out); return
-    if args.timeout<1: ap.error('--timeout 必须大于零')
-    project=pathlib.Path(args.project).expanduser().resolve(); prompt=pathlib.Path(args.prompt).expanduser().resolve()
-    if not project.is_dir(): ap.error('项目目录不存在')
-    if not prompt.is_file(): ap.error('提示词文件不存在')
-    if not shutil.which('codex'): ap.error('未找到 codex；请先安装并登录 Codex CLI')
-    if subprocess.run(['git','-C',str(project),'rev-parse','--is-inside-work-tree'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode: ap.error('目标目录不是 Git 工作区')
-    run_id=dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-    out=pathlib.Path(args.output).expanduser().resolve() if args.output else pathlib.Path.home()/'codex-agent-experiments'/run_id
-    out.mkdir(parents=True,exist_ok=False)
-    # Do not copy auth or environment variables into experiment output.
-    prompt_text=prompt.read_text(encoding='utf-8'); (out/'使用的任务.txt').write_text(prompt_text,encoding='utf-8')
-    head=subprocess.run(['git','-C',str(project),'rev-parse','HEAD'],capture_output=True,text=True).stdout.strip()
-    ver=subprocess.run(['codex','--version'],capture_output=True,text=True).stdout.strip()
-    cmd=['codex','exec','--json','--enable','multi_agent','--sandbox','read-only' if args.mode=='readonly' else 'workspace-write','-C',str(project)]
-    if args.model: cmd.extend(['--model',args.model])
-    cmd.append('-')
-    print('任务已启动，记录保存到：',out,flush=True)
-    print('运行结束或达到超时后生成报告；Codex 的详细过程写入原始文件。',flush=True)
-    start=time.time(); monotonic_start=time.monotonic(); timed_out=False
-    with (out/'codex-events.jsonl').open('w',encoding='utf-8') as stdout, (out/'codex-stderr.log').open('w',encoding='utf-8') as stderr:
-        try:
-            proc=subprocess.Popen(cmd,stdout=stdout,stderr=stderr,stdin=subprocess.PIPE,start_new_session=True,text=True)
-            stop=threading.Event()
-            sampler=threading.Thread(target=sample_processes,args=(proc.pid,out/'进程资源.csv',stop),daemon=True); sampler.start()
-            try:
-                proc.communicate(input=prompt_text,timeout=args.timeout); code=proc.returncode
-            except subprocess.TimeoutExpired:
-                timed_out=True; code=124
+    if sys.version_info < (3,9): raise SetupError('需要 Python 3.9 或更新版本。')
+    root=pathlib.Path.home()/'codex-agent-experiments'/('android01-'+dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+    root.mkdir(parents=True,exist_ok=False); print('本次实验目录：',root,flush=True)
+    log=root/'准备过程.log'; info={'status':'准备中','app_url':APP_URL,'app_commit':APP_REV,'workflow_url':FLOW_URL,'workflow_commit':FLOW_REV,'phases':[],'devices':[],'started_utc':dt.datetime.now(dt.timezone.utc).isoformat()}
+    processes=[]; files=[]; stop=threading.Event(); sampler=None; code=1
+    @contextlib.contextmanager
+    def phase(name):
+        print('\n【'+name+'】',flush=True); start=time.monotonic(); item={'name':name,'seconds':0,'status':'进行中'}; info['phases'].append(item)
+        try: yield
+        except BaseException:
+            item['status']='失败或中断'; raise
+        else: item['status']='完成'
+        finally: item['seconds']=round(time.monotonic()-start,3)
+    try:
+        with phase('检查工具与登录'):
+            if sys.platform=='darwin': os.environ['PATH']='/opt/homebrew/bin:/usr/local/bin:'+os.environ.get('PATH','')
+            for name in ('git','python3','node','npm'):
+                if not shutil.which(name): raise SetupError(f'缺少 {name}；请安装 Git、Python 3 和 Node.js 20 或更高版本后重试。')
+            version=subprocess.run(['node','--version'],capture_output=True,text=True).stdout.strip()
+            m=re.match(r'v(\d+)',version)
+            if not m or int(m.group(1))<20: raise SetupError('设备操作工具需要 Node.js 20 或更高版本。')
+            image_tool='sips' if sys.platform=='darwin' else 'magick'
+            if not shutil.which(image_tool): raise SetupError(f'缺少截图缩放工具 {image_tool}；请安装 ImageMagick 或使用系统自带 sips。')
+            env=java21(); env['npm_config_cache']=str(root/'npm缓存')
+            if not shutil.which('codex',path=env.get('PATH')):
+                print('正在本次实验目录安装 Codex CLI。',flush=True)
+                command(['npm','install','--prefix',str(root/'codex工具'),'--no-audit','--no-fund','@openai/codex'],env=env,logfile=log,timeout=900)
+                env['PATH']=str(root/'codex工具/node_modules/.bin')+os.pathsep+env['PATH']
+                os.environ['PATH']=env['PATH']
+            sdk=locate_sdk(); env['ANDROID_HOME']=str(sdk); env['ANDROID_SDK_ROOT']=str(sdk)
+            adb=tool(sdk,'platform-tools/adb'); emulator=tool(sdk,'emulator/emulator'); sdkmanager=tool(sdk,'cmdline-tools/latest/bin/sdkmanager'); avdmanager=tool(sdk,'cmdline-tools/latest/bin/avdmanager')
+            if subprocess.run(['codex','login','status'],env=env).returncode:
+                print('请按 Codex 提示完成浏览器登录。',flush=True)
+                command(['codex','login'],env=env,interactive=True)
+                command(['codex','login','status'],env=env,interactive=True)
+            info['codex_version']=subprocess.run(['codex','--version'],env=env,capture_output=True,text=True).stdout.strip()
+            venv=root/'工具环境'; command([sys.executable,'-m','venv',str(venv)],logfile=log)
+            py=venv/'bin/python'; command([str(py),'-m','pip','install','python-docx>=1.1,<2'],logfile=log,env=env,timeout=600)
+        with phase('准备设备操作服务'):
+            command(['npm','install','--prefix',str(root/'设备工具'),'--no-audit','--no-fund','@mobilenext/mobile-mcp@1.0.17'],env=env,logfile=log,timeout=900)
+            mcp=root/'设备工具/node_modules/.bin/mcp-server-mobile'
+            if not mcp.is_file(): raise SetupError('设备操作服务安装后缺少可执行入口。')
+            env['ANDROID_EXPERIMENT_MCP_COMMAND']=str(mcp)
+            info['device_tool']='@mobilenext/mobile-mcp@1.0.17'
+        with phase('准备 Android SDK 与两个模拟器'):
+            abi='arm64-v8a' if os.uname().machine.lower() in ('arm64','aarch64') else 'x86_64'
+            image='system-images;android-34;google_apis;'+abi
+            if not (sdk/'platforms/android-36').is_dir() or not (sdk/'system-images/android-34/google_apis'/abi).is_dir():
+                print('将使用 Android SDK Manager 安装平台 36 和 API 34 模拟器镜像；如出现许可协议，请在此窗口阅读并选择。',flush=True)
+                command([sdkmanager,'--install','platforms;android-36',image],env=env,interactive=True,timeout=1800)
+            avdhome=root/'设备数据'; avdhome.mkdir(); env['ANDROID_AVD_HOME']=str(avdhome); env['ANDROID_USER_HOME']=str(root/'android用户数据'); pathlib.Path(env['ANDROID_USER_HOME']).mkdir()
+            command([adb,'start-server'],env=env,logfile=log,timeout=30)
+            for idx,p in enumerate(ports(2)):
+                name=f'research_{root.name.replace("-", "_")}_{idx+1}'; serial=f'emulator-{p}'
+                command([avdmanager,'create','avd','-n',name,'-k',image],env=env,logfile=log,stdin='no\n',timeout=90)
+                fh=(root/f'模拟器{idx+1}.log').open('w',encoding='utf-8'); files.append(fh)
+                proc=subprocess.Popen([emulator,'-avd',name,'-port',str(p),'-no-window','-no-audio','-no-boot-anim','-no-snapshot-save'],env=env,stdout=fh,stderr=subprocess.STDOUT,start_new_session=True)
+                processes.append((serial,proc)); info['devices'].append({'slot':idx+1,'avd':name,'serial':serial,'pid':proc.pid})
+            sampler=threading.Thread(target=sample_devices,args=(processes,root/'设备资源.csv',stop),daemon=True); sampler.start()
+            for serial,proc in processes: booted(adb,serial,env,proc)
+        with phase('下载固定应用和公开工作流'):
+            project=root/'应用'; flow=root/'公开工作流'
+            for url,path,rev in ((APP_URL,project,APP_REV),(FLOW_URL,flow,FLOW_REV)):
+                command(['git','clone','--filter=blob:none','--depth','1','--no-checkout',url,str(path)],logfile=log,timeout=900)
+                command(['git','fetch','--depth','1','origin',rev],cwd=path,logfile=log,timeout=300)
+                command(['git','checkout','--detach',rev],cwd=path,logfile=log,timeout=120)
+                got=subprocess.check_output(['git','rev-parse','HEAD'],cwd=path,text=True).strip()
+                if got != rev: raise SetupError('检出的 Git 版本与固定版本不一致。')
+            skills=project/'.agents/skills'; skills.mkdir(parents=True,exist_ok=True)
+            shutil.copytree(flow/'skills/android-bug-priority-tree',skills/'android-bug-priority-tree')
+            # Existing project checkout is an isolated experiment copy.
+            env['GRADLE_USER_HOME']=str(root/'Gradle缓存')
+        with phase('构建应用和设备测试'):
+            command(['./gradlew',':app:assembleDemoDebug',':app:assembleDemoDebugAndroidTest','--no-daemon'],cwd=project,env=env,logfile=log,timeout=2700)
+            app_apks=list((project/'app/build/outputs/apk/demo/debug').glob('*.apk'))
+            test_apks=list((project/'app/build/outputs/apk/androidTest/demo/debug').glob('*.apk'))
+            if len(app_apks)!=1 or len(test_apks)!=1: raise SetupError(f'APK 数量不符合预期：应用 {len(app_apks)}，测试 {len(test_apks)}。')
+            for serial,_ in processes:
+                for apk in (app_apks[0],test_apks[0]): command([adb,'-s',serial,'install','-r',str(apk)],env=env,logfile=log,timeout=180)
+                testlog=root/(serial+'-基线测试.log')
+                with testlog.open('w',encoding='utf-8') as f:
+                    p=subprocess.run([adb,'-s',serial,'shell','am','instrument','-w',APP_ID+'.test/com.google.samples.apps.nowinandroid.core.testing.NiaTestRunner'],env=env,stdout=f,stderr=subprocess.STDOUT,timeout=900)
+                text=testlog.read_text(encoding='utf-8',errors='replace')
+                match=re.search(r'OK\s*\(\s*(\d+)\s+tests?\s*\)',text)
+                if p.returncode or not match or int(match.group(1))<1 or re.search(r'FAILURES!!!|INSTRUMENTATION_FAILED|INSTRUMENTATION_ABORTED',text):
+                    raise SetupError(f'{serial} 的基线设备测试未验证成功，请查看 {testlog}。')
+                info['devices'][int(serial==processes[1][0])]['baseline_tests']=int(match.group(1))
+        with phase('运行真实 Codex 多 Agent'):
+            serials=[p[0] for p in processes]
+            prompt=f'''请使用原生多 Agent 工具，按仓库内 $android-bug-priority-tree 公开工作流测试并修复当前 Now in Android demoDebug 应用。项目是隔离副本。\n先阅读项目 AGENTS.md 与该 skill。你是 Leader，负责规划、分派、结果收集、集成与汇报。先建立用户旅程地图；并行启动两个设备测试 Worker，分别负责 For You、Interests / Bookmarks 的真实用户路径，每个 Worker 必须获取以下互不重叠的设备槽位之一：{serials[0]}、{serials[1]}。每个涉及设备的子 Agent 指令必须写明唯一 serial，所有 adb 操作显式使用 adb -s SERIAL；严禁两个并发 Worker 操作同一设备，后续确认、修复和独立验证按空闲槽位排队。Worker 必须在自己的模拟器执行真实交互或设备测试、提供命令与结果、对应设备 serial、问题及证据路径；未执行必须标记未执行，不能伪造。测试需用 demo 的本地数据，不访问真实生产服务，不使用个人账号。\n遵循公开工作流：报告候选、独立确认；仅在发现且确认真实缺陷时分派修复，修复须带回归测试，集成后由不同 Worker 独立复验。无缺陷时如实报告，禁止人为制造缺陷或为通信量填充消息。所有 Worker 需要清楚报告任务、消息和状态；Leader 汇总命令、通过失败数量、代码更改、设备证据和限制。不推送或发布。当前目录为实验副本，允许本地修改与工作流所需的本地提交。\n'''
+            (root/'本次任务.txt').write_text(prompt,encoding='utf-8')
+            runner=root/'runner.py'
+            source=zlib.decompress(base64.b64decode(RUNNER)).decode('utf-8')
+            needle="    cmd.append('-')"
+            addition="    if os.environ.get('ANDROID_EXPERIMENT_MCP_COMMAND'):\n        cmd.extend(['-c', 'mcp_servers.mobile-mcp.command=' + json.dumps(os.environ['ANDROID_EXPERIMENT_MCP_COMMAND']), '-c', 'sandbox_workspace_write.network_access=true'])\n"
+            if source.count(needle)!=1: raise SetupError('内置采集器配置入口不匹配。')
+            runner.write_text(source.replace(needle,addition+needle),encoding='utf-8')
+            env['RUST_LOG']=(env.get('RUST_LOG','error')+',codex_otel.agent_communication=info')
+            env['PATH']=str(sdk/'platform-tools')+os.pathsep+str(sdk/'emulator')+os.pathsep+env['PATH']
+            p=subprocess.run([str(py),str(runner),'--project',str(project),'--mode','write','--timeout','7200','--prompt',str(root/'本次任务.txt'),'--output',str(root/'记录')],env=env)
+            info['codex_exit_code']=p.returncode
+            if p.returncode: raise SetupError(f'Codex 未成功完成（退出码 {p.returncode}）；请查看 记录/codex-stderr.log。')
+            meta=json.loads((root/'记录/实验信息.json').read_text(encoding='utf-8'))
+            info['session_count']=meta.get('session_count',0); info['recognized_messages']=meta.get('recognized_messages',0)
+            if info['session_count']<3 or info['recognized_messages']<1:
+                raise SetupError('未关联到至少两个子会话或未识别到协作消息；不能判定多 Agent 测试完成，请检查原始会话。')
+            info['status']='Codex 已结束，待人工核对设备使用和 Agent 结果'; code=0
+    except KeyboardInterrupt:
+        info['status']='用户中断'; info['detail']='实验中断；保留已产生的日志。'; code=130
+    except (SetupError, OSError, subprocess.SubprocessError, ValueError) as e:
+        info['status']='未完成'; info['detail']=str(e); print('\n未完成：',e,flush=True); code=1
+    finally:
+        stop.set()
+        if sampler: sampler.join(timeout=5)
+        for serial,proc in processes:
+            if proc.poll() is None:
                 try: os.killpg(proc.pid,signal.SIGTERM)
                 except ProcessLookupError: pass
-                try: proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    try: os.killpg(proc.pid,signal.SIGKILL)
-                    except ProcessLookupError: pass
-                    proc.wait()
-            finally: stop.set(); sampler.join(timeout=6)
-        except OSError as e: code=127; stderr.write(str(e))
-    elapsed_seconds=round(time.monotonic()-monotonic_start,3)
-    finished=dt.datetime.now(dt.timezone.utc).isoformat()
-    root=''
-    for _,obj in lines(out/'codex-events.jsonl'):
-        if obj.get('type')=='thread.started': root=str(obj.get('thread_id') or ''); break
-    codex_home=pathlib.Path(os.environ.get('CODEX_HOME') or pathlib.Path.home()/'.codex').expanduser()
-    sessions,note=collect_sessions(codex_home,out,root,start)
-    manifest={'run_id':run_id,'project':str(project),'git_head':head,'codex_version':ver,'model_override':args.model,'mode':args.mode,'started_utc':dt.datetime.fromtimestamp(start,dt.timezone.utc).isoformat(),'finished_utc':finished,'elapsed_seconds':elapsed_seconds,'exit_code':code,'timed_out':timed_out,'root_thread_id':root,'session_count':len(sessions),'session_note':note}
-    rows=analyze(out,manifest,sessions)
-    print(f'报告已生成：{out}/实验统计报告.docx')
-    print(f'消息明细：{out}/消息明细.csv；识别 {len(rows)} 条。')
-    if code: print(f'Codex 退出码 {code}，请查看 codex-stderr.log 和实验报告。',file=sys.stderr)
+        for serial,proc in processes:
+            try: proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                try: os.killpg(proc.pid,signal.SIGKILL)
+                except ProcessLookupError: pass
+                proc.wait()
+        for f in files: f.close()
+        info['finished_utc']=dt.datetime.now(dt.timezone.utc).isoformat()
+        report(root,info)
+        print('\n实验报告：',root/'实验报告.html',flush=True)
+        if sys.platform=='darwin': subprocess.run(['open',str(root/'实验报告.html')],check=False)
     return code
-if __name__=='__main__': sys.exit(main())
+
+if __name__=='__main__':
+    try: rc=main()
+    except Exception as exc:
+        print('启动失败：',exc,file=sys.stderr); rc=1
+    if sys.stdin.isatty():
+        try: input('\n按回车关闭窗口…')
+        except (EOFError,KeyboardInterrupt): pass
+    sys.exit(rc)
