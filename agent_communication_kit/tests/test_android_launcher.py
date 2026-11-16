@@ -10,6 +10,67 @@ def executable(path,body):
  path.parent.mkdir(parents=True,exist_ok=True); path.write_text(body,encoding='utf-8'); path.chmod(0o755)
 
 class Integration(unittest.TestCase):
+ def test_gradle_reuses_previous_finished_same_app_cache(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   base=pathlib.Path(tmp);cache=base/'cache';cache.mkdir();root=base/'android01-20261116-2';root.mkdir()
+   previous=base/'android01-20261116-1';previous.mkdir();(previous/'Gradle缓存').mkdir()
+   (previous/'实验状态.json').write_text(json.dumps({'app_commit':module.APP_REV,'finished_utc':'2026-11-16T00:00:00Z'}))
+   self.assertEqual(module.gradle_cache_home(root,cache),previous/'Gradle缓存')
+ def test_gradle_maven_tls_failure_switches_official_mirror(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp);shared=root/'shared';shared.mkdir();log=root/'build.log';env={'GRADLE_USER_HOME':str(shared)};info={};calls=[]
+   def fake_command(args,**kwargs):
+    calls.append(kwargs['env'].copy())
+    with log.open('a') as f:f.write("Could not get resource 'https://repo.maven.apache.org/maven2/artifact.jar'\nIllegal packet size: 49729\n" if len(calls)==1 else 'BUILD SUCCESSFUL\n')
+    return types.SimpleNamespace(returncode=1 if len(calls)==1 else 0)
+   with mock.patch.object(module,'command',side_effect=fake_command):module.build_gradle_with_retry(root,root,env,log,info)
+   self.assertEqual(len(calls),2);self.assertEqual(info['gradle_attempts'],2);self.assertEqual(info['maven_central_mirror'],'https://repo1.maven.org/maven2/')
+   home=pathlib.Path(env['GRADLE_USER_HOME']);self.assertEqual((home/'caches/modules-2').resolve(),(shared/'caches/modules-2').resolve())
+   self.assertFalse((home/'caches').is_symlink());self.assertTrue((home/'init.d/maven-central-fallback.gradle').is_file())
+ def test_gradle_non_network_error_does_not_retry(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp);shared=root/'shared';shared.mkdir();log=root/'build.log';calls=[]
+   def fake_command(args,**kwargs):calls.append(args);log.write_text('Compilation error: unresolved reference X\n');return types.SimpleNamespace(returncode=1)
+   with mock.patch.object(module,'command',side_effect=fake_command):
+    with self.assertRaises(module.SetupError):module.build_gradle_with_retry(root,root,{'GRADLE_USER_HOME':str(shared)},log,{})
+   self.assertEqual(len(calls),1)
+ def test_gradle_certificate_error_is_not_ignored(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp);shared=root/'shared';shared.mkdir();log=root/'build.log';calls=[]
+   def fake_command(args,**kwargs):calls.append(args);log.write_text('PKIX path building failed: certificate has expired\n');return types.SimpleNamespace(returncode=1)
+   with mock.patch.object(module,'command',side_effect=fake_command):
+    with self.assertRaises(module.SetupError):module.build_gradle_with_retry(root,root,{'GRADLE_USER_HOME':str(shared)},log,{})
+   self.assertEqual(len(calls),1)
+ def test_gradle_http_proxy_preserves_environment_and_rejects_credentials(self):
+  env={'JAVA_TOOL_OPTIONS':'-Xmx2g','OTHER':'unchanged'}
+  with mock.patch.object(module.urllib.request,'getproxies',return_value={'https':'http://127.0.0.1:8080','no':'localhost,.example.com'}):
+   result=module.gradle_proxy_environment(env)
+  self.assertEqual(env['JAVA_TOOL_OPTIONS'],'-Xmx2g');self.assertIn('-Dhttps.proxyHost=127.0.0.1',result['JAVA_TOOL_OPTIONS']);self.assertIn('*.example.com',result['JAVA_TOOL_OPTIONS']);self.assertEqual(result['OTHER'],'unchanged')
+  with mock.patch.object(module.urllib.request,'getproxies',return_value={'https':'http://user:password@127.0.0.1:8080'}):self.assertIsNone(module.gradle_proxy_environment(env))
+ def test_expired_proxy_certificate_is_not_retried_with_system_trust(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp);shared=root/'shared';shared.mkdir();log=root/'build.log';calls=[]
+   failures=['repo.maven.apache.org Illegal packet size: 49729','repo1.maven.org Connection reset','PKIX path building failed: certificate has expired']
+   def fake_command(args,**kwargs):
+    calls.append(kwargs['env'].copy())
+    with log.open('a') as f:f.write(failures[len(calls)-1]+'\n')
+    return types.SimpleNamespace(returncode=1)
+   with mock.patch.object(module,'command',side_effect=fake_command),mock.patch.object(module.urllib.request,'getproxies',return_value={'https':'http://127.0.0.1:8080'}),mock.patch.object(module,'gradle_system_trust_environment') as trust:
+    with self.assertRaises(module.SetupError):module.build_gradle_with_retry(root,root,{'GRADLE_USER_HOME':str(shared)},log,{})
+   self.assertEqual(len(calls),3);trust.assert_not_called()
+ def test_gradle_respects_existing_trust_store(self):
+  self.assertIsNone(module.gradle_system_trust_environment({'JAVA_TOOL_OPTIONS':'-Djavax.net.ssl.trustStore=/existing'}))
+ def test_gradle_proxy_can_use_existing_system_trust_after_pkix(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp);shared=root/'shared';shared.mkdir();log=root/'build.log';env={'GRADLE_USER_HOME':str(shared)};info={};calls=[]
+   failures=["repo.maven.apache.org Illegal packet size: 49729",'repo1.maven.org Connection reset','PKIX path building failed: unable to find valid certification path','BUILD SUCCESSFUL']
+   def fake_command(args,**kwargs):
+    calls.append(kwargs['env'].copy())
+    with log.open('a') as f:f.write(failures[len(calls)-1]+'\n')
+    return types.SimpleNamespace(returncode=0 if len(calls)==4 else 1)
+   def trusted(e):return {**e,'JAVA_TOOL_OPTIONS':e['JAVA_TOOL_OPTIONS']+' -Djavax.net.ssl.trustStore=/trusted/system'}
+   with mock.patch.object(module,'command',side_effect=fake_command),mock.patch.object(module.urllib.request,'getproxies',return_value={'https':'http://127.0.0.1:8080'}),mock.patch.object(module,'gradle_system_trust_environment',side_effect=trusted):module.build_gradle_with_retry(root,root,env,log,info)
+   self.assertEqual(len(calls),4);self.assertTrue(info['gradle_system_trust']);self.assertIn('-Djavax.net.ssl.trustStore=',calls[-1]['JAVA_TOOL_OPTIONS'])
  def test_old_java_is_replaced_by_downloaded_jdk(self):
   with tempfile.TemporaryDirectory() as tmp:
    base=pathlib.Path(tmp); cache=base/'cache'; cache.mkdir(); bindir=base/'bin'; bindir.mkdir()

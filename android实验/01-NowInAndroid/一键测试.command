@@ -509,6 +509,138 @@ def tool(sdk,*paths):
         if p.is_file() and os.access(p,os.X_OK): return str(p)
     raise SetupError(f'Android SDK 安装后仍缺少 {paths[0]}；请查看准备过程.log。')
 
+def gradle_cache_home(root,cache):
+    """Reuse only an earlier finished run for this exact pinned application."""
+    shared=cache/'Gradle缓存'
+    if shared.is_dir(): return shared
+    for previous in sorted(root.parent.glob('android01-*'),reverse=True):
+        if previous==root: continue
+        existing=previous/'Gradle缓存'; manifest=previous/'实验状态.json'
+        if not existing.is_dir() or not manifest.is_file(): continue
+        try: info=json.loads(manifest.read_text(encoding='utf-8'))
+        except (OSError,ValueError): continue
+        if isinstance(info,dict) and info.get('app_commit')==APP_REV and info.get('finished_utc'):
+            print('[Gradle] 复用上次已完成运行的依赖缓存，避免重新下载。',flush=True)
+            return existing
+    shared.mkdir(parents=True,exist_ok=True); return shared
+
+def gradle_mirror_home(root,shared):
+    """Keep the official Maven Central mirror scoped to this experiment."""
+    home=root/'Gradle备用配置'; home.mkdir(exist_ok=True)
+    # Keep Gradle's version-specific configuration-cache keys local to each home.
+    # Share only the dependency artifact store and wrapper distributions.
+    (home/'caches').mkdir(exist_ok=True)
+    for name in ('caches/modules-2','wrapper'):
+        target=shared/name; target.mkdir(parents=True,exist_ok=True)
+        link=home/name
+        if not link.exists(): link.symlink_to(target,target_is_directory=True)
+    scripts=home/'init.d'; scripts.mkdir(exist_ok=True)
+    (scripts/'maven-central-fallback.gradle').write_text('''import org.gradle.api.artifacts.repositories.MavenArtifactRepository
+
+def adjust = { repo ->
+  if (repo instanceof MavenArtifactRepository && repo.url != null && repo.url.host == 'repo.maven.apache.org' && repo.url.path.replaceAll('/+$', '') == '/maven2') {
+    repo.setUrl('https://repo1.maven.org/maven2/')
+  }
+}
+gradle.beforeSettings { settings ->
+  settings.pluginManagement.repositories.configureEach(adjust)
+  settings.dependencyResolutionManagement.repositories.configureEach(adjust)
+}
+gradle.beforeProject { project ->
+  project.buildscript.repositories.configureEach(adjust)
+  project.repositories.configureEach(adjust)
+}
+''',encoding='utf-8')
+    return home
+
+def gradle_proxy_environment(env):
+    """Translate simple unauthenticated OS/ENV HTTP proxies into JVM properties."""
+    existing=env.get('JAVA_TOOL_OPTIONS','')+' '+env.get('GRADLE_OPTS','')
+    if re.search(r'(?i)(https?\.proxyhost|socksproxyhost|java\.net\.usesystemproxies)',existing): return None
+    proxies=urllib.request.getproxies(); raw=proxies.get('https') or proxies.get('http')
+    if not raw: return None
+    try:
+        u=urllib.parse.urlsplit(raw if '://' in raw else 'http://'+raw)
+        if u.scheme.lower()!='http' or not u.hostname or not u.port or u.username or u.password: return None
+        if not re.fullmatch(r'[A-Za-z0-9.:-]+',u.hostname): return None
+    except ValueError: return None
+    excludes=['localhost','127.*','[::1]']
+    if '*' in [x.strip() for x in (proxies.get('no') or '').split(',')]: return None
+    for part in (proxies.get('no') or '').split(','):
+        part=part.strip().lower()
+        if not part or '/' in part or part=='*' or not re.fullmatch(r'[a-z0-9.*_-]+(?::[0-9]+)?',part): continue
+        part=part.split(':',1)[0]
+        if part.startswith('.'):
+            excludes.extend([part[1:],'*'+part])
+        else: excludes.append(part)
+    props=[f'-Dhttps.proxyHost={u.hostname}',f'-Dhttps.proxyPort={u.port}',f'-Dhttp.proxyHost={u.hostname}',f'-Dhttp.proxyPort={u.port}','-Dhttp.nonProxyHosts='+'|'.join(dict.fromkeys(excludes))]
+    result=env.copy(); result['JAVA_TOOL_OPTIONS']=(env.get('JAVA_TOOL_OPTIONS','')+' '+' '.join(props)).strip()
+    return result
+
+def gradle_system_trust_environment(env):
+    """Use an existing OS trust store only; never add certificates or disable verification."""
+    existing=env.get('JAVA_TOOL_OPTIONS','')+' '+env.get('GRADLE_OPTS','')
+    if re.search(r'(?i)javax\.net\.ssl\.truststore',existing): return None
+    if sys.platform=='darwin':
+        options=['-Djavax.net.ssl.trustStoreType=KeychainStore','-Djavax.net.ssl.trustStore=NONE']
+    elif sys.platform.startswith('linux') and pathlib.Path('/etc/ssl/certs/java/cacerts').is_file():
+        options=['-Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts']
+    else: return None
+    result=env.copy();result['JAVA_TOOL_OPTIONS']=(env.get('JAVA_TOOL_OPTIONS','')+' '+' '.join(options)).strip()
+    return result
+
+def log_since(path,offset):
+    try:
+        with path.open('rb') as log:
+            log.seek(0,os.SEEK_END);end=log.tell();log.seek(max(offset,end-2*1024*1024))
+            return log.read().decode('utf-8',errors='replace')
+    except OSError: return ''
+
+def retryable_gradle_network_error(output):
+    text=output.lower()
+    if any(x in text for x in ('pkix path building','certificate_unknown','certificate has expired','unable to find valid certification path','hostname verification failed')): return False
+    return any(x in text for x in ('illegal packet size','connection reset','connection timed out','connect timed out','read timed out','sockettimeoutexception','unexpected end of file','connection closed prematurely','temporarily unavailable','http response code: 502','http response code: 503','http response code: 504'))
+
+def build_gradle_with_retry(project,root,env,log,info):
+    args=['./gradlew',':app:assembleDemoDebug',':app:assembleDemoDebugAndroidTest','--no-daemon','--console=plain']
+    mirror=False; proxy_used=False; system_trust=False; active=env.copy(); shared=pathlib.Path(active['GRADLE_USER_HOME'])
+    for attempt in range(1,5):
+        info['gradle_attempts']=attempt
+        print(f'[构建] 第 {attempt} 次尝试；此前成功下载的依赖会保留。',flush=True)
+        offset=log.stat().st_size if log.exists() else 0
+        try: p=command(args,cwd=project,env=active,logfile=log,timeout=2700,check=False)
+        except subprocess.TimeoutExpired: raise SetupError(f'Gradle 构建超过 45 分钟上限；完整日志：{log}。')
+        if not p.returncode:
+            info['gradle_attempts']=attempt
+            if mirror: info['maven_central_mirror']='https://repo1.maven.org/maven2/'
+            if system_trust: info['gradle_system_trust']=True
+            env.update(active); return
+        output=log_since(log,offset); lower=output.lower()
+        cert_error=('pkix path building' in lower or 'unable to find valid certification path' in lower)
+        hard_cert_error=any(x in lower for x in ('certificate has expired','certificate expired','hostname verification failed','certificate revoked','not yet valid'))
+        if cert_error and not hard_cert_error and proxy_used and not system_trust and attempt<4:
+            adjusted=gradle_system_trust_environment(active)
+            if adjusted:
+                active=adjusted;system_trust=True;info['gradle_system_trust']=True
+                print('[构建] 代理证书不在 JDK 默认信任库中；尝试使用本机已有的系统受信证书库，仍执行 HTTPS 验证。',flush=True)
+                continue
+        if not retryable_gradle_network_error(output) or attempt>=3:
+            lines=[x.strip() for x in output.replace('\r','\n').splitlines() if x.strip()]
+            detail=' | '.join(lines[-16:])[-2600:]
+            raise SetupError(f'Gradle 构建失败（退出码 {p.returncode}）。'+('最近输出：'+redact_diagnostic(detail)+'；' if detail else '')+f'完整日志：{log}。')
+        if not mirror and 'repo.maven.apache.org' in lower:
+            print('[构建] 发现 Maven Central 下载连接异常；自动改用其官方备用地址并复用缓存，保持 HTTPS 验证。',flush=True)
+            active['GRADLE_USER_HOME']=str(gradle_mirror_home(root,shared));mirror=True;info['maven_central_mirror']='https://repo1.maven.org/maven2/'
+        elif attempt==2:
+            adjusted=gradle_proxy_environment(active)
+            if adjusted:
+                active=adjusted;proxy_used=True
+                print('[构建] 检测到系统 HTTP 代理，将为本次 Gradle 进程配置代理后重试。',flush=True)
+            else: print('[构建] 正在保留现有安全配置并重试网络下载。',flush=True)
+        else:
+            print('[构建] 检测到临时网络错误，保留缓存后自动重试。',flush=True)
+    raise SetupError(f'Gradle 构建未完成；完整日志：{log}。')
+
 def ports(count):
     # Probe both emulator console and adb port; the emulator itself performs the final bind.
     answer=[]
@@ -624,6 +756,8 @@ def report(root, info):
     if info.get('failed_stage'): parts.append('<p>失败阶段：'+e(str(info['failed_stage']))+'</p>')
     parts.append('<p>应用和基线：Now in Android <code>'+APP_REV+'</code>；公开工作流：Android Bug Priority Tree <code>'+FLOW_REV+'</code>。应用与流程的组合、设备槽位属于本实验配置。</p>')
     if info.get('model_selection'): parts.append('<p>正式任务模型选择：<code>'+e(str(info['model_selection']))+'</code>。</p>')
+    if info.get('maven_central_mirror'): parts.append('<p>构建使用 Maven Central 官方备用地址：<code>'+e(str(info['maven_central_mirror']))+'</code>；HTTPS 校验保持启用。</p>')
+    if info.get('gradle_system_trust'): parts.append('<p>构建通过系统已有的受信任证书库验证代理连接；未关闭 HTTPS 验证。</p>')
     parts.append('<h2>正式开发耗时</h2><p>只计 Codex 多 Agent 正式任务从启动到结束的时间；环境安装、下载、模拟器准备、基线构建和报告生成均不计入。工具调用时间可互相重叠，不能相加得到总耗时。</p><table><tr><th>阶段</th><th>秒</th><th>状态</th></tr>')
     if 'formal_elapsed_seconds' in info:
         parts.append('<tr><td>Codex 多 Agent 正式任务</td><td>'+e(str(info['formal_elapsed_seconds']))+'</td><td>'+e(str(info.get('formal_status','未知')))+'</td></tr>')
@@ -741,10 +875,10 @@ def main():
             skills=project/'.agents/skills'; skills.mkdir(parents=True,exist_ok=True)
             shutil.copytree(flow/'skills/android-bug-priority-tree',skills/'android-bug-priority-tree')
             # Existing project checkout is an isolated experiment copy.
-            env['GRADLE_USER_HOME']=str(root/'Gradle缓存')
+            env['GRADLE_USER_HOME']=str(gradle_cache_home(root,cache))
         with phase('构建应用和设备测试'):
             print('[构建] 正在解析依赖并构建应用和设备测试 APK；首次构建可能较慢。输出和状态会持续显示。',flush=True)
-            command(['./gradlew',':app:assembleDemoDebug',':app:assembleDemoDebugAndroidTest','--no-daemon','--console=plain'],cwd=project,env=env,logfile=log,timeout=2700)
+            build_gradle_with_retry(project,root,env,log,info)
             app_apks=list((project/'app/build/outputs/apk/demo/debug').glob('*.apk'))
             test_apks=list((project/'app/build/outputs/apk/androidTest/demo/debug').glob('*.apk'))
             if len(app_apks)!=1 or len(test_apks)!=1: raise SetupError(f'APK 数量不符合预期：应用 {len(app_apks)}，测试 {len(test_apks)}。')
