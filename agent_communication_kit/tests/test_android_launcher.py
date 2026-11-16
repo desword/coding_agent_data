@@ -2,7 +2,7 @@ import base64, importlib.machinery, importlib.util, json, os, pathlib, sys, temp
 from unittest import mock
 
 ROOT=pathlib.Path(__file__).resolve().parents[2]
-path=ROOT/'一键启动多Agent实验.command'
+path=ROOT/'android实验/01-NowInAndroid/一键测试.command'
 loader=importlib.machinery.SourceFileLoader('android_experiment_test',str(path))
 spec=importlib.util.spec_from_loader(loader.name,loader); module=importlib.util.module_from_spec(spec); loader.exec_module(module)
 
@@ -10,6 +10,10 @@ def executable(path,body):
  path.parent.mkdir(parents=True,exist_ok=True); path.write_text(body,encoding='utf-8'); path.chmod(0o755)
 
 class Integration(unittest.TestCase):
+ def test_root_shortcut_points_to_case_script(self):
+  shortcut=ROOT/'一键启动多Agent实验.command'
+  self.assertTrue(shortcut.is_symlink())
+  self.assertEqual(shortcut.resolve(),path.resolve())
  def test_embedded_collector_matches_source(self):
   self.assertEqual(zlib.decompress(base64.b64decode(module.RUNNER)), (ROOT/'agent_communication_kit/agent_experiment.py').read_bytes())
  def test_complete_fake_pipeline(self):
