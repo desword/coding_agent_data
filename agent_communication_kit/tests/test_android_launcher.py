@@ -81,6 +81,48 @@ class Integration(unittest.TestCase):
    with mock.patch.object(module.subprocess,'run',return_value=types.SimpleNamespace(returncode=0,stdout='darwin-arm64\n')),mock.patch.object(module,'command',side_effect=AssertionError('should migrate')):
     first=module.prepare_mobile_tool(root,cache,{},base/'test.log');shutil.rmtree(previous);second=module.prepare_mobile_tool(root,cache,{},base/'test.log')
    self.assertEqual(first,second);self.assertTrue(first.is_file());self.assertTrue(first.resolve().is_relative_to(cache))
+ def test_low_disk_space_does_not_consume_or_delete_legacy_cache(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   base=pathlib.Path(tmp);cache=base/'cache';cache.mkdir();root=base/'android01-2';root.mkdir();old=base/'android01-1';old.mkdir()
+   (old/'实验状态.json').write_text(json.dumps({'app_commit':module.APP_REV,'finished_utc':'done'}))
+   entry=old/'Gradle缓存/caches/build-cache-1'/('a'*32);entry.parent.mkdir(parents=True);entry.write_text('original')
+   with mock.patch.object(module.shutil,'disk_usage',return_value=types.SimpleNamespace(free=100)):
+    shared=module.gradle_cache_home(root,cache)
+   self.assertEqual(entry.read_text(),'original');self.assertFalse((shared/'caches/build-cache-1'/('a'*32)).exists())
+   marker=json.loads((shared/'.旧批次下载已迁移').read_text());self.assertNotIn(old.name,marker['runs'])
+ def test_build_task_cache_migrates_even_after_older_marker(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   base=pathlib.Path(tmp);cache=base/'cache';cache.mkdir();root=base/'android01-2';root.mkdir();old=base/'android01-1';old.mkdir()
+   (old/'实验状态.json').write_text(json.dumps({'app_commit':module.APP_REV,'finished_utc':'done'}))
+   oldcache=old/'Gradle备用配置/caches/build-cache-1';oldcache.mkdir(parents=True);key='a'*32;(oldcache/key).write_text('cached output');(oldcache/'build-cache-1.lock').write_text('lock')
+   shared=cache/'Gradle缓存';shared.mkdir();(shared/'.旧批次下载已迁移').write_text(json.dumps({'version':1,'runs':['android01-1']}))
+   self.assertEqual(module.gradle_cache_home(root,cache),shared)
+   self.assertEqual((shared/'caches/build-cache-1'/key).read_text(),'cached output');self.assertFalse((shared/'caches/build-cache-1/build-cache-1.lock').exists());self.assertTrue((oldcache/key).is_file())
+   mirror=module.gradle_mirror_home(root,shared)
+   self.assertEqual((mirror/'caches/build-cache-1').resolve(),(shared/'caches/build-cache-1').resolve())
+ def test_packaging_failure_retries_same_workspace_with_stacktrace(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp);shared=root/'shared';shared.mkdir();log=root/'build.log';info={};calls=[]
+   def fake_command(args,**kwargs):
+    calls.append((args,kwargs))
+    with log.open('a') as f:f.write("Execution failed for task ':app:packageDemoDebug'\nA failure occurred in PackageAndroidArtifact$IncrementalSplitterRunnable\n" if len(calls)==1 else 'BUILD SUCCESSFUL\n')
+    return types.SimpleNamespace(returncode=1 if len(calls)==1 else 0)
+   env={'GRADLE_USER_HOME':str(shared)}
+   with mock.patch.object(module,'command',side_effect=fake_command):module.build_gradle_with_retry(root,root,env,log,info)
+   self.assertEqual(len(calls),2);self.assertTrue(info['gradle_packaging_retry']);self.assertEqual(info['gradle_attempts'],2)
+   self.assertTrue(all('--stacktrace' in x[0] and x[1]['cwd']==root for x in calls));self.assertEqual(calls[0][1]['env']['GRADLE_USER_HOME'],calls[1][1]['env']['GRADLE_USER_HOME'])
+ def test_packaging_root_cause_is_reported_without_unsafe_retry(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp);shared=root/'shared';shared.mkdir();log=root/'build.log';calls=[]
+   output="* What went wrong:\nExecution failed for task ':app:packageDemoDebug'.\n> PackageAndroidArtifact$IncrementalSplitterRunnable\n* Try:\nSee documentation\n* Exception is:\nCaused by: java.io.IOException: No space left on device\n"
+   def fake_command(args,**kwargs):calls.append(args);log.write_text(output);return types.SimpleNamespace(returncode=1)
+   with mock.patch.object(module,'command',side_effect=fake_command):
+    with self.assertRaises(module.SetupError) as error:module.build_gradle_with_retry(root,root,{'GRADLE_USER_HOME':str(shared)},log,{})
+   self.assertEqual(len(calls),1);self.assertIn('Caused by: java.io.IOException: No space left on device',str(error.exception))
+ def test_failure_summary_keeps_root_cause_after_long_paths(self):
+  output='* What went wrong:\n> PackageAndroidArtifact$IncrementalSplitterRunnable\n* Try:\nsee log\n* Exception is:\nCaused by: java.io.IOException: '+('long-path/'*100)+' No space left on device\n'
+  result=module.gradle_failure_summary(output)
+  self.assertIn('IncrementalSplitterRunnable',result);self.assertIn('No space left on device',result)
  def test_gradle_maven_tls_failure_switches_official_mirror(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=pathlib.Path(tmp);shared=root/'shared';shared.mkdir();log=root/'build.log';env={'GRADLE_USER_HOME':str(shared)};info={};calls=[]
@@ -334,7 +376,7 @@ for line in sys.stdin:
    (sdk/'platforms/android-36').mkdir(parents=True); (sdk/'system-images/android-34/google_apis/x86_64').mkdir(parents=True)
    executable(bindir/'magick','#!/bin/sh\nexit 0\n')
    executable(bindir/'java','#!/bin/sh\necho \'openjdk version "21.0.3"\' >&2\n')
-   executable(sdk/'emulator/emulator','#!/usr/bin/python3\nimport time\ntime.sleep(100)\n')
+   executable(sdk/'emulator/emulator','#!/usr/bin/python3\nimport os,pathlib,time\n(pathlib.Path(os.environ["ANDROID_AVD_HOME"])/"emulator-started").touch()\ntime.sleep(100)\n')
    executable(sdk/'cmdline-tools/latest/bin/sdkmanager','#!/bin/sh\nexit 0\n')
    executable(sdk/'cmdline-tools/latest/bin/avdmanager','#!/bin/sh\nexit 0\n')
    executable(sdk/'platform-tools/adb',"#!/bin/sh\ncase \"$*\" in *getprop*) echo 1;; *instrument*) echo 'OK (3 tests)';; *) echo Success;; esac\n")
@@ -344,7 +386,7 @@ args=sys.argv[1:]
 if 'clone' in args:
  p=pathlib.Path(args[-1]);p.mkdir(parents=True)
  if 'nowinandroid.git' in args[-2]:
-  g=p/'gradlew';g.write_text("#!/bin/sh\\nmkdir -p app/build/outputs/apk/demo/debug app/build/outputs/apk/androidTest/demo/debug\\ntouch app/build/outputs/apk/demo/debug/app.apk app/build/outputs/apk/androidTest/demo/debug/test.apk\\n");g.chmod(0o755)
+  g=p/'gradlew';g.write_text("#!/bin/sh\\ntest ! -e $ANDROID_AVD_HOME/emulator-started || exit 91\\nmkdir -p app/build/outputs/apk/demo/debug app/build/outputs/apk/androidTest/demo/debug\\ntouch app/build/outputs/apk/demo/debug/app.apk app/build/outputs/apk/androidTest/demo/debug/test.apk\\n");g.chmod(0o755)
  else:
   q=p/'skills/android-bug-priority-tree';q.mkdir(parents=True);(q/'SKILL.md').write_text('fixture')
 elif 'rev-parse' in args:

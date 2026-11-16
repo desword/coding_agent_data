@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone Android/Codex experiment. Run by double-click or python3."""
 from __future__ import annotations
-import base64, codecs, collections, contextlib, csv, datetime as dt, fcntl, hashlib, html, json, math, os, pathlib, re, selectors, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request, webbrowser, xml.etree.ElementTree as ET, zipfile, zlib
+import base64, codecs, collections, contextlib, csv, datetime as dt, errno, fcntl, hashlib, html, json, math, os, pathlib, re, selectors, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request, webbrowser, xml.etree.ElementTree as ET, zipfile, zlib
 
 APP_URL = 'https://github.com/android/nowinandroid.git'
 APP_REV = 'a49ed253d75e61a2b6ab80a8da677b57437b08eb'
@@ -654,7 +654,7 @@ def gradle_cache_home(root,cache):
         completed=set()
         try:
             state=json.loads(marker.read_text(encoding='utf-8'))
-            if isinstance(state,dict) and isinstance(state.get('runs'),list):completed={x for x in state['runs'] if isinstance(x,str)}
+            if isinstance(state,dict) and state.get('version')==2 and isinstance(state.get('runs'),list):completed={x for x in state['runs'] if isinstance(x,str)}
         except (OSError,ValueError):pass
         seen=set();migrated=0;any_failed=False
         def ignore(folder,names):
@@ -662,6 +662,11 @@ def gradle_cache_home(root,cache):
         def copy_if_missing(source,destination):
             dest=pathlib.Path(destination)
             if dest.exists():return str(dest)
+            # Preserve room for a new APK build; do not fill the disk while duplicating old caches.
+            try: free=shutil.disk_usage(dest.parent).free
+            except OSError: free=None
+            if free is not None and free<pathlib.Path(source).stat().st_size+2*1024**3:
+                raise OSError(errno.ENOSPC,'公共缓存剩余空间不足，已跳过旧缓存复制')
             tmp=None
             try:
                 with tempfile.NamedTemporaryFile(prefix='.copy-',dir=dest.parent,delete=False) as f:tmp=pathlib.Path(f.name)
@@ -683,6 +688,15 @@ def gradle_cache_home(root,cache):
                         with heartbeat('正在迁移已下载的 Gradle 依赖'):
                             shutil.copytree(content,shared/'caches/modules-2/files-2.1',dirs_exist_ok=True,ignore=ignore,copy_function=copy_if_missing)
                         seen.add(content.resolve());migrated+=1
+                    task_cache=source/'caches/build-cache-1'
+                    if task_cache.is_dir() and task_cache.resolve() not in seen:
+                        target=shared/'caches/build-cache-1';target.mkdir(parents=True,exist_ok=True)
+                        print('[缓存] 将旧批次可复用的构建任务结果复制到公共缓存。',flush=True)
+                        with heartbeat('正在迁移可复用的 Gradle 构建结果'):
+                            for entry in task_cache.iterdir():
+                                if entry.is_file() and not entry.is_symlink() and re.fullmatch(r'[0-9a-fA-F]{32,64}',entry.name):
+                                    copy_if_missing(entry,target/entry.name)
+                        seen.add(task_cache.resolve())
                     dists=source/'wrapper/dists'
                     if dists.is_dir() and dists.resolve() not in seen:
                         for version in dists.iterdir():
@@ -693,10 +707,13 @@ def gradle_cache_home(root,cache):
                                     shutil.copytree(package,shared/'wrapper/dists'/version.name/package.name,dirs_exist_ok=True,ignore=ignore,copy_function=copy_if_missing)
                         seen.add(dists.resolve())
                 except (OSError,shutil.Error) as exc:
-                    batch_failed=True;any_failed=True;print('[缓存] 部分旧缓存暂时无法复制，将继续使用已有文件并在下次重试：',type(exc).__name__,flush=True)
+                    batch_failed=True;any_failed=True
+                    if 'ENOSPC' in str(exc) or 'No space left' in str(exc) or '剩余空间不足' in str(exc):
+                        print('[缓存] 磁盘空间不足，已停止复制部分旧缓存；旧文件保留，下次会重试。',flush=True)
+                    else:print('[缓存] 部分旧缓存暂时无法复制，将继续使用已有文件并在下次重试：',type(exc).__name__,flush=True)
             if not batch_failed:completed.add(previous.name)
         with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',prefix='.gradle-migration-',dir=shared,delete=False) as f:
-            json.dump({'version':1,'runs':sorted(completed)},f,ensure_ascii=False);temporary=pathlib.Path(f.name)
+            json.dump({'version':2,'runs':sorted(completed)},f,ensure_ascii=False);temporary=pathlib.Path(f.name)
         try:os.replace(temporary,marker)
         finally:
             if temporary.exists():temporary.unlink()
@@ -708,9 +725,9 @@ def gradle_mirror_home(root,shared):
     """Keep the official Maven Central mirror scoped to this experiment."""
     home=root/'Gradle备用配置'; home.mkdir(exist_ok=True)
     # Keep Gradle's version-specific configuration-cache keys local to each home.
-    # Share only the dependency artifact store and wrapper distributions.
+    # Share the dependency store, reusable task outputs and wrapper distributions.
     (home/'caches').mkdir(exist_ok=True)
-    for name in ('caches/modules-2','wrapper'):
+    for name in ('caches/modules-2','caches/build-cache-1','wrapper'):
         target=shared/name; target.mkdir(parents=True,exist_ok=True)
         link=home/name
         if not link.exists(): link.symlink_to(target,target_is_directory=True)
@@ -781,9 +798,34 @@ def retryable_gradle_network_error(output):
     if any(x in text for x in ('pkix path building','certificate_unknown','certificate has expired','unable to find valid certification path','hostname verification failed')): return False
     return any(x in text for x in ('illegal packet size','connection reset','connection timed out','connect timed out','read timed out','sockettimeoutexception','unexpected end of file','connection closed prematurely','temporarily unavailable','http response code: 502','http response code: 503','http response code: 504'))
 
+def gradle_failure_summary(output):
+    lines=output.replace('\r','\n').splitlines();summary=[];inside=False
+    for raw in lines:
+        line=raw.strip()
+        if line=='* What went wrong:': inside=True;continue
+        if inside and line.startswith('* '): break
+        if inside and line:summary.append(line)
+    causes=[x.strip() for x in lines if x.strip().startswith(('Caused by:','Suppressed:'))]
+    if summary or causes:
+        head=' | '.join(summary[:12])[:300]
+        tail=' | '.join((x if len(x)<=300 else x[:110]+' … '+x[-185:]) for x in causes[-2:])
+        result=' | '.join(x for x in (head,tail) if x)
+    else:
+        result=' | '.join(x.strip() for x in lines if x.strip())[-1000:]
+    return redact_diagnostic(result)
+
+def retryable_packaging_error(output):
+    lower=output.lower()
+    matches=':app:packagedemodebug' in lower and 'incrementalsplitterrunnable' in lower
+    # Do not blindly retry deterministic failures that require user action or a code fix.
+    blocked=('no space left on device','disk full','permission denied','outofmemoryerror','keystore was tampered','unrecoverablekeyexception','duplicate entry','certificate has expired','hostname verification failed')
+    return matches and not any(x in lower for x in blocked)
+
 def build_gradle_with_retry(project,root,env,log,info):
-    args=['./gradlew',':app:assembleDemoDebug',':app:assembleDemoDebugAndroidTest','--no-daemon','--console=plain']
-    mirror=False; proxy_used=False; system_trust=False; active=env.copy(); shared=pathlib.Path(active['GRADLE_USER_HOME'])
+    args=['./gradlew',':app:assembleDemoDebug',':app:assembleDemoDebugAndroidTest','--no-daemon','--console=plain','--stacktrace']
+    mirror=False; proxy_used=False; system_trust=False; packaging_retried=False; active=env.copy(); shared=pathlib.Path(active['GRADLE_USER_HOME'])
+    try:info['gradle_disk_free_bytes_before']=shutil.disk_usage(project).free
+    except OSError:pass
     for attempt in range(1,5):
         info['gradle_attempts']=attempt
         print(f'[构建] 第 {attempt} 次尝试；此前成功下载的依赖会保留。',flush=True)
@@ -796,6 +838,8 @@ def build_gradle_with_retry(project,root,env,log,info):
             if system_trust: info['gradle_system_trust']=True
             env.update(active); return
         output=log_since(log,offset); lower=output.lower()
+        try:info['gradle_disk_free_bytes_after']=shutil.disk_usage(project).free
+        except OSError:pass
         cert_error=('pkix path building' in lower or 'unable to find valid certification path' in lower)
         hard_cert_error=any(x in lower for x in ('certificate has expired','certificate expired','hostname verification failed','certificate revoked','not yet valid'))
         if cert_error and not hard_cert_error and proxy_used and not system_trust and attempt<4:
@@ -804,10 +848,14 @@ def build_gradle_with_retry(project,root,env,log,info):
                 active=adjusted;system_trust=True;info['gradle_system_trust']=True
                 print('[构建] 代理证书不在 JDK 默认信任库中；尝试使用本机已有的系统受信证书库，仍执行 HTTPS 验证。',flush=True)
                 continue
-        if not retryable_gradle_network_error(output) or attempt>=3:
-            lines=[x.strip() for x in output.replace('\r','\n').splitlines() if x.strip()]
-            detail=' | '.join(lines[-16:])[-2600:]
-            raise SetupError(f'Gradle 构建失败（退出码 {p.returncode}）。'+('最近输出：'+redact_diagnostic(detail)+'；' if detail else '')+f'完整日志：{log}。')
+        network_error=retryable_gradle_network_error(output)
+        if not network_error and not packaging_retried and retryable_packaging_error(output) and attempt<4:
+            packaging_retried=True;info['gradle_packaging_retry']=True
+            print('[构建] APK 打包任务失败；保留当前工作区的已完成输出，自动重试一次。若仍失败，将报告底层异常。',flush=True)
+            continue
+        if not network_error or attempt>=3:
+            detail=gradle_failure_summary(output)
+            raise SetupError(f'Gradle 构建失败（退出码 {p.returncode}）。'+('错误摘要：'+detail+'；' if detail else '')+f'完整日志：{log}。')
         if not mirror and 'repo.maven.apache.org' in lower:
             print('[构建] 发现 Maven Central 下载连接异常；自动改用其官方备用地址并复用缓存，保持 HTTPS 验证。',flush=True)
             active['GRADLE_USER_HOME']=str(gradle_mirror_home(root,shared));mirror=True;info['maven_central_mirror']='https://repo1.maven.org/maven2/'
@@ -938,6 +986,7 @@ def report(root, info):
     if info.get('model_selection'): parts.append('<p>正式任务模型选择：<code>'+e(str(info['model_selection']))+'</code>。</p>')
     if info.get('maven_central_mirror'): parts.append('<p>构建使用 Maven Central 官方备用地址：<code>'+e(str(info['maven_central_mirror']))+'</code>；HTTPS 校验保持启用。</p>')
     if info.get('gradle_system_trust'): parts.append('<p>构建通过系统已有的受信任证书库验证代理连接；未关闭 HTTPS 验证。</p>')
+    if 'gradle_disk_free_bytes_after' in info: parts.append('<p>构建失败时，应用所在磁盘剩余空间：'+str(round(info['gradle_disk_free_bytes_after']/1073741824,2))+' GiB。</p>')
     parts.append('<h2>正式开发耗时</h2><p>只计 Codex 多 Agent 正式任务从启动到结束的时间；环境安装、下载、模拟器准备、基线构建和报告生成均不计入。工具调用时间可互相重叠，不能相加得到总耗时。</p><table><tr><th>阶段</th><th>秒</th><th>状态</th></tr>')
     if 'formal_elapsed_seconds' in info:
         parts.append('<tr><td>Codex 多 Agent 正式任务</td><td>'+e(str(info['formal_elapsed_seconds']))+'</td><td>'+e(str(info.get('formal_status','未知')))+'</td></tr>')
@@ -980,7 +1029,7 @@ def main():
     root.mkdir(parents=True,exist_ok=False); print('本次实验目录：',root,flush=True)
     log=root/'准备过程.log'; info={'status':'准备中','app_url':APP_URL,'app_commit':APP_REV,'workflow_url':FLOW_URL,'workflow_commit':FLOW_REV,'devices':[],'launcher_started_utc':dt.datetime.now(dt.timezone.utc).isoformat()}
     processes=[]; files=[]; stop=threading.Event(); sampler=None; code=1
-    stages=['检查工具与登录','准备设备操作服务','准备 Android SDK 与两个模拟器','下载固定应用和公开工作流','构建应用和设备测试','运行真实 Codex 多 Agent']
+    stages=['检查工具与登录','准备设备操作服务','准备两个模拟器配置','下载固定应用和公开工作流','构建应用和设备测试','运行真实 Codex 多 Agent']
     @contextlib.contextmanager
     def phase(name):
         number=stages.index(name)+1 if name in stages else '?'
@@ -1032,17 +1081,14 @@ def main():
             mcp=shared_mcp or prepare_mobile_tool(root,cache,env,log)
             env['ANDROID_EXPERIMENT_MCP_COMMAND']=str(mcp)
             info['device_tool']='@mobilenext/mobile-mcp@1.0.17'
-        with phase('准备 Android SDK 与两个模拟器'):
+        with phase('准备两个模拟器配置'):
             avdhome=root/'设备数据'; avdhome.mkdir(); env['ANDROID_AVD_HOME']=str(avdhome); env['ANDROID_USER_HOME']=str(root/'android用户数据'); pathlib.Path(env['ANDROID_USER_HOME']).mkdir()
-            command([adb,'start-server'],env=env,logfile=log,timeout=30)
-            for idx,p in enumerate(ports(2)):
-                name=f'research_{root.name.replace("-", "_")}_{idx+1}'; serial=f'emulator-{p}'
+            planned=[]
+            for idx in range(2):
+                name=f'research_{root.name.replace("-", "_")}_{idx+1}'
                 command([avdmanager,'create','avd','-n',name,'-k',image],env=env,logfile=log,stdin='no\n',timeout=90)
-                fh=(root/f'模拟器{idx+1}.log').open('w',encoding='utf-8'); files.append(fh)
-                proc=subprocess.Popen([emulator,'-avd',name,'-port',str(p),'-no-window','-no-audio','-no-boot-anim','-no-snapshot-save'],env=env,stdout=fh,stderr=subprocess.STDOUT,start_new_session=True)
-                processes.append((serial,proc)); info['devices'].append({'slot':idx+1,'avd':name,'serial':serial,'pid':proc.pid})
-            sampler=threading.Thread(target=sample_devices,args=(processes,root/'设备资源.csv',stop),daemon=True); sampler.start()
-            for serial,proc in processes: booted(adb,serial,env,proc)
+                planned.append(name);info['devices'].append({'slot':idx+1,'avd':name})
+            print('[设备] 模拟器配置已创建；应用构建结束后再启动设备，以减少构建期间的资源占用。',flush=True)
         with phase('下载固定应用和公开工作流'):
             project=root/'应用'; flow=root/'公开工作流'
             for url,path,rev in ((APP_URL,project,APP_REV),(FLOW_URL,flow,FLOW_REV)):
@@ -1061,6 +1107,15 @@ def main():
             app_apks=list((project/'app/build/outputs/apk/demo/debug').glob('*.apk'))
             test_apks=list((project/'app/build/outputs/apk/androidTest/demo/debug').glob('*.apk'))
             if len(app_apks)!=1 or len(test_apks)!=1: raise SetupError(f'APK 数量不符合预期：应用 {len(app_apks)}，测试 {len(test_apks)}。')
+            print('[设备] 应用构建完成，开始启动两个独立模拟器。',flush=True)
+            command([adb,'start-server'],env=env,logfile=log,timeout=30)
+            for idx,port in enumerate(ports(2)):
+                name=planned[idx];serial=f'emulator-{port}'
+                fh=(root/f'模拟器{idx+1}.log').open('w',encoding='utf-8');files.append(fh)
+                proc=subprocess.Popen([emulator,'-avd',name,'-port',str(port),'-no-window','-no-audio','-no-boot-anim','-no-snapshot-save'],env=env,stdout=fh,stderr=subprocess.STDOUT,start_new_session=True)
+                processes.append((serial,proc));info['devices'][idx].update({'serial':serial,'pid':proc.pid})
+            sampler=threading.Thread(target=sample_devices,args=(processes,root/'设备资源.csv',stop),daemon=True);sampler.start()
+            for serial,proc in processes:booted(adb,serial,env,proc)
             for serial,_ in processes:
                 for apk in (app_apks[0],test_apks[0]): command([adb,'-s',serial,'install','-r',str(apk)],env=env,logfile=log,timeout=180)
                 testlog=root/(serial+'-基线测试.log')
