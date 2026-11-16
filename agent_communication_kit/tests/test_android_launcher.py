@@ -1,4 +1,4 @@
-import base64, contextlib, hashlib, importlib.machinery, importlib.util, io, json, os, pathlib, shutil, subprocess, sys, tarfile, tempfile, threading, time, unittest, zlib
+import base64, contextlib, hashlib, importlib.machinery, importlib.util, io, json, os, pathlib, shutil, subprocess, sys, tarfile, tempfile, threading, time, types, unittest, zlib
 from unittest import mock
 
 ROOT=pathlib.Path(__file__).resolve().parents[2]
@@ -88,6 +88,50 @@ class Integration(unittest.TestCase):
     module.command([sys.executable,'-u','-c',"import time;print('started',flush=True);time.sleep(30)"],logfile=logfile,timeout=.5)
    self.assertLess(time.monotonic()-start,5)
    self.assertIn('started',logfile.read_text())
+ def test_codex_error_from_json_with_empty_stderr_is_reported(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp); record=root/'记录'; record.mkdir()
+   (record/'codex-stderr.log').write_text('')
+   (record/'codex-events.jsonl').write_text(json.dumps({'type':'turn.failed','error':{'message':'Model is not available for this account; token=abc123secret'}})+'\n')
+   result=module.codex_failure(root,1)
+   self.assertIn('Model is not available for this account',result)
+   self.assertNotIn('abc123secret',result); self.assertIn('[已隐藏]',result)
+ def test_codex_error_from_stderr_when_events_are_empty(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp); record=root/'记录'; record.mkdir()
+   (record/'codex-events.jsonl').write_text('')
+   (record/'codex-stderr.log').write_text('ERROR unable to reach service: Proxy 403\n')
+   self.assertIn('Proxy 403',module.codex_failure(root,1))
+ def test_no_codex_diagnostic_does_not_invent_cause(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   result=module.codex_failure(pathlib.Path(tmp),1)
+   self.assertIn('未能在事件和错误日志中提取原因',result); self.assertIn('codex-events.jsonl',result)
+ def test_invalid_openai_key_guides_isolated_login_and_rechecks(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp); cache=root/'cache';cache.mkdir();calls=[]
+   env={'PATH':'/bin','OPENAI_API_KEY':'sk-or-v1-fake','CODEX_API_KEY':'another-fake','CODEX_HOME':'/original','CUSTOM_SENTINEL':'keep'}
+   def fake_command(argv,**kwargs):
+    calls.append((argv,kwargs))
+    if '--skip-git-repo-check' in argv:
+     log=kwargs['logfile']
+     if log.name.endswith('-1.log'):
+      event={'type':'turn.failed','error':{'message':'401 invalid_api_key https://api.openai.com/v1/responses'}};rc=1
+     else: event={'type':'turn.completed'};rc=0
+     log.write_text(json.dumps(event)+'\n');return types.SimpleNamespace(returncode=rc)
+    return types.SimpleNamespace(returncode=0)
+   with mock.patch.object(module,'command',side_effect=fake_command),mock.patch.object(module.subprocess,'run',return_value=types.SimpleNamespace(returncode=1)):
+    result=module.codex_connection_check(env,root,cache)
+   self.assertEqual(env['CODEX_HOME'],'/original'); self.assertEqual(env['OPENAI_API_KEY'],'sk-or-v1-fake')
+   self.assertEqual(result['CODEX_HOME'],str(cache/'codex官方登录'));self.assertNotIn('OPENAI_API_KEY',result);self.assertNotIn('CODEX_API_KEY',result);self.assertEqual(result['CUSTOM_SENTINEL'],'keep')
+   self.assertEqual(sum('--skip-git-repo-check' in argv for argv,_ in calls),2);self.assertTrue(any(argv==['codex','login'] for argv,_ in calls))
+ def test_non_auth_connection_error_does_not_force_login(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=pathlib.Path(tmp);cache=root/'cache';cache.mkdir()
+   def fake_command(argv,**kwargs):
+    kwargs['logfile'].write_text(json.dumps({'type':'turn.failed','error':{'message':'Proxy HTTP 403'}})+'\n');return types.SimpleNamespace(returncode=1)
+   with mock.patch.object(module,'command',side_effect=fake_command),mock.patch.object(module.subprocess,'run') as status:
+    with self.assertRaises(module.SetupError) as exc:module.codex_connection_check({'PATH':'/bin'},root,cache)
+   self.assertIn('Proxy HTTP 403',str(exc.exception));status.assert_not_called()
  def test_log_activity_shows_latest_event_without_message_content(self):
   with tempfile.TemporaryDirectory() as tmp:
    event=pathlib.Path(tmp)/'events.jsonl'; event.write_text(json.dumps({'type':'item.started','item':{'type':'command_execution','command':'secret command'}})+'\n')
@@ -132,6 +176,7 @@ elif 'rev-parse' in args:
 import json,os,pathlib,sys
 if len(sys.argv)>1 and sys.argv[1]=='login': sys.exit(0)
 if '--version' in sys.argv: print('codex-cli fake');sys.exit(0)
+if '--skip-git-repo-check' in sys.argv: print(json.dumps({'type':'turn.completed'}));sys.exit(0)
 assert any('mcp_servers.mobile-mcp.command=' in arg for arg in sys.argv)
 assert 'sandbox_workspace_write.network_access=true' in sys.argv
 p=pathlib.Path(os.environ['CODEX_HOME'])/'sessions';p.mkdir(parents=True,exist_ok=True)

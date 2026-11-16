@@ -17,6 +17,54 @@ HEARTBEAT_SECONDS=15
 def clock(seconds):
     seconds=max(0,int(seconds)); return f'{seconds//60:02d}:{seconds%60:02d}'
 
+def redact_diagnostic(value):
+    # Error text can contain credentials or private endpoint query parameters.
+    text=str(value).replace('\x1b','').replace('\r',' ').replace('\n',' ')
+    text=re.sub(r'(?i)\b(bearer\s+)[^\s,;\"\']+',r'\1[已隐藏]',text)
+    text=re.sub(r'\bsk-[A-Za-z0-9_*-]{4,}', '[已隐藏]',text)
+    text=re.sub(r'(?i)\b(api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|authorization|password|secret)\b(\s*[=:]\s*[\"\']?)[^\s,;\"\']+',r'\1\2[已隐藏]',text)
+    text=re.sub(r'(https?://)[^/@\s]+@',r'\1[已隐藏]@',text)
+    text=re.sub(r'(?i)([?&](?:api[_-]?key|key|token|access[_-]?token)=)[^&#\s]+',r'\1[已隐藏]',text)
+    return re.sub(r'\s+',' ',text).strip()[:1000]
+
+def event_error(event):
+    if not isinstance(event,dict): return ''
+    kind=event.get('type',''); item=event.get('item')
+    if isinstance(item,dict) and item.get('type')=='error':
+        return item.get('message') if isinstance(item.get('message'),str) else ''
+    if kind not in ('error','turn.failed','turn.error','item.failed'): return ''
+    for field in ('message','error'):
+        val=event.get(field)
+        if isinstance(val,str): return val
+        if isinstance(val,dict) and isinstance(val.get('message'),str): return val['message']
+    return ''
+
+def codex_failure(out,code):
+    messages=[]
+    event_path=out/'记录/codex-events.jsonl'
+    try:
+        with event_path.open('rb') as f:
+            f.seek(0,os.SEEK_END); size=f.tell(); f.seek(max(0,size-2*1024*1024)); lines=f.read().splitlines()
+        for line in lines:
+            try: msg=event_error(json.loads(line))
+            except (ValueError,UnicodeDecodeError): continue
+            msg=redact_diagnostic(msg)
+            if msg and msg not in messages: messages.append(msg)
+    except OSError: pass
+    if not messages:
+        for path in (out/'记录/codex-stderr.log',out/'Codex运行.log'):
+            try:
+                with path.open('rb') as f:
+                    f.seek(0,os.SEEK_END); size=f.tell(); f.seek(max(0,size-256*1024)); lines=f.read().decode('utf-8',errors='replace').splitlines()
+                for line in lines:
+                    if re.search(r'(?i)\b(error|failed|fatal|unauthori[sz]ed|forbidden|denied|timeout|traceback)\b',line):
+                        msg=redact_diagnostic(line)
+                        if msg and msg not in messages: messages.append(msg)
+            except OSError: pass
+    if not messages:
+        return f'Codex 未成功完成（退出码 {code}），未能在事件和错误日志中提取原因；请查看 记录/codex-events.jsonl、记录/codex-stderr.log 和 Codex运行.log。'
+    return f'Codex 未成功完成（退出码 {code}）。最近的错误：'+' | '.join(messages[-3:])+'。完整事件和诊断见 记录/ 及 Codex运行.log。'
+
 def file_activity(paths):
     details=[]
     for label,path in paths or []:
@@ -37,7 +85,10 @@ def file_activity(paths):
                     kind=event.get('type',''); item=event.get('item') or {}; subkind=item.get('type','') if isinstance(item,dict) else ''
                     if not isinstance(kind,str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{1,100}',kind): continue
                     if not isinstance(subkind,str) or not re.fullmatch(r'[a-zA-Z0-9_.-]{0,100}',subkind): subkind=''
-                    details.append('最近 Codex 事件 '+kind+(' / '+subkind if subkind else '')); break
+                    details.append('最近 Codex 事件 '+kind+(' / '+subkind if subkind else ''))
+                    problem=event_error(event)
+                    if problem: details.append('Codex 提示（可能正在重试）：'+redact_diagnostic(problem))
+                    break
             except OSError: pass
     return '；'.join(details)
 
@@ -65,7 +116,7 @@ def stop_group(p):
     except ProcessLookupError: pass
     p.wait()
 
-def command(argv, *, cwd=None, env=None, logfile=None, timeout=None, stdin=None, interactive=False, check=True, watch_paths=None):
+def command(argv, *, cwd=None, env=None, logfile=None, timeout=None, stdin=None, interactive=False, check=True, watch_paths=None, show_output=True):
     print('\n$', ' '.join(str(x) for x in argv), flush=True)
     offset=0
     if interactive:
@@ -91,7 +142,9 @@ def command(argv, *, cwd=None, env=None, logfile=None, timeout=None, stdin=None,
                     for key,_ in selector.select(timeout=0.5):
                         data=os.read(key.fd,8192)
                         if not data: selector.unregister(key.fileobj); continue
-                        chunk=decoder.decode(data); log.write(chunk); log.flush(); sys.stdout.write(chunk); sys.stdout.flush(); last_output=time.monotonic()
+                        chunk=decoder.decode(data); log.write(chunk); log.flush()
+                        if show_output: sys.stdout.write(chunk); sys.stdout.flush()
+                        last_output=time.monotonic()
                     now=time.monotonic()
                     alive=p.poll() is None
                     if not alive:
@@ -101,13 +154,16 @@ def command(argv, *, cwd=None, env=None, logfile=None, timeout=None, stdin=None,
                     if now>=next_heartbeat:
                         silent=int(now-last_output); details=file_activity(watch_paths)
                         state='命令进程仍在运行' if alive else '命令主进程已退出，正在读取剩余输出'
-                        text=f'\n[状态] {state}；已耗时 {clock(now-start)}，距上次窗口输出 {silent} 秒。'
+                        output_label='窗口输出' if show_output else '日志更新'
+                        text=f'\n[状态] {state}；已耗时 {clock(now-start)}，距上次{output_label} {silent} 秒。'
                         if timeout is not None: text+=f' 超时上限 {clock(timeout)}（并非预计完成时间）。'
                         if details: text+=' '+details+'。'
                         if silent>=60: text+=' 暂无新输出；可能正在下载或处理，不能确认已有进展。'
                         print(text,flush=True); next_heartbeat=now+HEARTBEAT_SECONDS
                 rest=decoder.decode(b'',final=True)
-                if rest: log.write(rest); log.flush(); sys.stdout.write(rest); sys.stdout.flush()
+                if rest:
+                    log.write(rest); log.flush()
+                    if show_output: sys.stdout.write(rest); sys.stdout.flush()
                 p.wait()
             except BaseException:
                 stop_group(p); raise
@@ -124,6 +180,60 @@ def command(argv, *, cwd=None, env=None, logfile=None, timeout=None, stdin=None,
             except OSError: pass
         raise SetupError(f'{argv[0]} 返回 {p.returncode}'+detail+(f'；完整日志：{logfile}' if logfile else ''))
     return p
+
+def probe_result(path):
+    errors=[]; terminal=''
+    try:
+        lines=path.read_text(encoding='utf-8',errors='replace').splitlines()
+        for line in lines:
+            try: event=json.loads(line)
+            except ValueError: continue
+            if not isinstance(event,dict): continue
+            if event.get('type') in ('turn.completed','turn.failed'): terminal=event['type']
+            error=event_error(event)
+            if error: errors.append(error)
+    except OSError: pass
+    return terminal,errors
+
+def experiment_codex_login(env,cache):
+    isolated=env.copy(); isolated['CODEX_HOME']=str(cache/'codex官方登录')
+    pathlib.Path(isolated['CODEX_HOME']).mkdir(mode=0o700,parents=True,exist_ok=True)
+    for key in ('OPENAI_API_KEY','CODEX_API_KEY','OPENAI_BASE_URL','OPENAI_API_BASE','OPENAI_ORGANIZATION','OPENAI_PROJECT'):
+        isolated.pop(key,None)
+    if subprocess.run(['codex','login','status'],env=isolated).returncode:
+        print('[认证检查] 请按 Codex 提示在浏览器中完成登录；不要在聊天或脚本中输入密钥。',flush=True)
+        command(['codex','login'],env=isolated,interactive=True)
+        command(['codex','login','status'],env=isolated,interactive=True)
+    return isolated
+
+def codex_connection_check(env,root,cache):
+    """Check the chosen model before building; never mutate the user's Codex home."""
+    def probe(attempt,probe_env):
+        log=root/f'Codex认证检查-{attempt}.log'
+        print('[认证检查] 正在用一条简短请求检查 Codex 模型访问；这不计入正式实验。',flush=True)
+        try:
+            result=command(['codex','exec','--json','--enable','multi_agent','--sandbox','read-only','--skip-git-repo-check','-C',str(root),'Reply with OK.'],env=probe_env,logfile=log,timeout=120,check=False,show_output=False)
+        except subprocess.TimeoutExpired:
+            raise SetupError(f'Codex 认证检查超过 120 秒；可能是网络或服务问题，详情见 {log}。')
+        terminal,errors=probe_result(log)
+        if not result.returncode and terminal=='turn.completed':
+            print('[认证检查] Codex 模型请求成功。',flush=True); return True,errors,log
+        return False,errors,log
+    ok,errors,log=probe(1,env)
+    if ok: return env
+    combined=' '.join(errors).lower()
+    invalid_key=('invalid_api_key' in combined or 'incorrect api key' in combined)
+    official_endpoint='https://api.openai.com/' in combined
+    if not (invalid_key and official_endpoint):
+        detail=' | '.join(redact_diagnostic(x) for x in errors[-3:])
+        raise SetupError('Codex 模型连接检查未通过：'+(detail or f'没有取得明确错误；请查看 {log}。'))
+    print('[认证检查] 当前密钥不适用于 OpenAI 官方接口。将为此实验单独使用 ChatGPT 浏览器登录；不会修改已有 Codex 登录或环境变量。',flush=True)
+    isolated=experiment_codex_login(env,cache)
+    ok,errors,log=probe(2,isolated)
+    if not ok:
+        detail=' | '.join(redact_diagnostic(x) for x in errors[-3:])
+        raise SetupError('实验专用登录后的模型连接仍未通过：'+(detail or f'没有取得明确错误；请查看 {log}。'))
+    return isolated
 
 def host():
     system={'darwin':'mac','linux':'linux'}.get(sys.platform)
@@ -439,7 +549,7 @@ def report(root, info):
     if not delivery: parts.append('<tr><td colspan="2">当前未获得可配对投递事件，无法判断实际投递耗时。</td></tr>')
     parts.append('</table><h2>瓶颈判断</h2><p>本报告不会把模型推理时间、Worker 执行时间或 wait 耗时归因于通信。缺少完整投递时间、跨路径对照与足够样本时，无法判断 Leader–Worker 通信是否为主要瓶颈。模拟器资源采样是设备槽位级，不等于 Agent 或远端模型独占资源。</p>')
     parts.append('<h2>设备与核对</h2><p>本次仅当两个模拟器都启动、安装 APK 并通过非零 Android 测试后才开始 Codex。Agent 使用指定设备仍需逐条核对会话、测试日志与证据，设备启动不证明任务完成。入口、设备数据、失败及未完成内容见实验状态与安装日志。</p>')
-    parts.append('<p>原始会话和报告可能包含源代码、截图或敏感信息。查看 <code>记录/消息明细.csv</code>、<code>记录/调用耗时.csv</code>、<code>投递时间明细.csv</code>、<code>记录/codex-stderr.log</code>、<code>设备资源.csv</code> 及原始会话核对。'+e(' '.join(diag))+'</p></html>')
+    parts.append('<p>原始会话和报告可能包含源代码、截图或敏感信息。查看 <code>记录/消息明细.csv</code>、<code>记录/调用耗时.csv</code>、<code>投递时间明细.csv</code>、<code>记录/codex-stderr.log</code>、<code>记录/codex-events.jsonl</code>、<code>Codex运行.log</code>、<code>设备资源.csv</code> 及原始会话核对。'+e(' '.join(diag))+'</p></html>')
     (root/'实验报告.html').write_text('\n'.join(parts),encoding='utf-8')
 
 def sample_devices(procs,path,stop):
@@ -478,11 +588,16 @@ def main():
                 if not shutil.which(name): raise SetupError(f'缺少 {name}；请先安装后重新运行。')
             cache=pathlib.Path.home()/'codex-agent-experiments/工具缓存'; cache.mkdir(parents=True,exist_ok=True)
             env=os.environ.copy(); env['npm_config_cache']=str(cache/'npm缓存')
-            env=java21(env,cache); env=node22(env,cache)
+            env=node22(env,cache)
             if not shutil.which('codex',path=env.get('PATH')):
                 print('正在本次实验目录安装 Codex CLI。',flush=True)
                 command(['npm','install','--prefix',str(root/'codex工具'),'--no-audit','--no-fund','@openai/codex'],env=env,logfile=log,timeout=900)
                 env['PATH']=str(root/'codex工具/node_modules/.bin')+os.pathsep+env['PATH']
+            if subprocess.run(['codex','login','status'],env=env).returncode:
+                print('未发现 Codex 登录，将为本实验准备独立登录。',flush=True)
+                env=experiment_codex_login(env,cache)
+            env=codex_connection_check(env,root,cache)
+            env=java21(env,cache)
             sdk=locate_sdk(cache); env['ANDROID_HOME']=str(sdk); env['ANDROID_SDK_ROOT']=str(sdk)
             sdkmanager,avdmanager=prepare_sdk_manager(sdk,cache)
             abi='arm64-v8a' if os.uname().machine.lower() in ('arm64','aarch64') else 'x86_64'
@@ -494,10 +609,6 @@ def main():
                 print('将自动安装缺少的 Android SDK 组件；如出现许可协议，请在窗口中阅读并选择。',flush=True)
                 command([sdkmanager,'--sdk_root='+str(sdk),'--install',*needed],env=env,interactive=True,timeout=3600)
             adb=tool(sdk,'platform-tools/adb'); emulator=tool(sdk,'emulator/emulator')
-            if subprocess.run(['codex','login','status'],env=env).returncode:
-                print('请按 Codex 提示完成浏览器登录。',flush=True)
-                command(['codex','login'],env=env,interactive=True)
-                command(['codex','login','status'],env=env,interactive=True)
             info['codex_version']=subprocess.run(['codex','--version'],env=env,capture_output=True,text=True).stdout.strip()
             venv=root/'工具环境'; command([sys.executable,'-m','venv',str(venv)],logfile=log)
             py=venv/'bin/python'; command([str(py),'-m','pip','install','python-docx>=1.1,<2','Pillow>=10,<13'],logfile=log,env=env,timeout=600)
@@ -573,7 +684,7 @@ def main():
             if meta.get('exit_code')!=127 and isinstance(meta.get('elapsed_seconds'),(int,float)):
                 info['formal_elapsed_seconds']=meta['elapsed_seconds']
                 info['formal_status']='完成' if not p.returncode else '失败或中断'
-            if p.returncode: raise SetupError(f'Codex 未成功完成（退出码 {p.returncode}）；请查看 记录/codex-stderr.log。')
+            if p.returncode: raise SetupError(codex_failure(root,p.returncode))
             info['session_count']=meta.get('session_count',0); info['recognized_messages']=meta.get('recognized_messages',0)
             if info['session_count']<3 or info['recognized_messages']<1:
                 raise SetupError('未关联到至少两个子会话或未识别到协作消息；不能判定多 Agent 测试完成，请检查原始会话。')
