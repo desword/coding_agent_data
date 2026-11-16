@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Standalone Android/Codex experiment. Run by double-click or python3."""
 from __future__ import annotations
-import base64, collections, contextlib, csv, datetime as dt, html, json, math, os, pathlib, re, shutil, signal, socket, statistics, subprocess, sys, tempfile, threading, time, urllib.parse, webbrowser, zlib
+import base64, collections, contextlib, csv, datetime as dt, hashlib, html, json, math, os, pathlib, re, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.parse, urllib.request, webbrowser, xml.etree.ElementTree as ET, zipfile, zlib
 
 APP_URL = 'https://github.com/android/nowinandroid.git'
 APP_REV = 'a49ed253d75e61a2b6ab80a8da677b57437b08eb'
@@ -24,30 +24,151 @@ def command(argv, *, cwd=None, env=None, logfile=None, timeout=None, stdin=None,
         raise SetupError(f'{argv[0]} 返回 {p.returncode}' + (f'，详情见 {logfile}' if logfile else ''))
     return p
 
-def locate_sdk():
-    candidates = [os.environ.get('ANDROID_SDK_ROOT'), os.environ.get('ANDROID_HOME'), str(pathlib.Path.home()/'Library/Android/sdk'), str(pathlib.Path.home()/'Android/Sdk')]
+def host():
+    system={'darwin':'mac','linux':'linux'}.get(sys.platform)
+    machine=os.uname().machine.lower()
+    arch={'arm64':'aarch64','aarch64':'aarch64','x86_64':'x64','amd64':'x64'}.get(machine)
+    if not system or not arch: raise SetupError('自动安装支持 macOS 和 Linux 的 Intel / ARM64；当前系统或处理器不受支持。')
+    return system,arch
+
+def fetch_bytes(url):
+    with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'android-agent-experiment/1.0'}),timeout=60) as r:
+        return r.read()
+
+def download(url, dest, checksum, algorithm='sha256'):
+    if not re.fullmatch(r'[0-9a-fA-F]{%d}' % (40 if algorithm=='sha1' else 64),checksum): raise SetupError('下载校验值格式不正确。')
+    print('下载：',url,flush=True)
+    digest=hashlib.new(algorithm)
+    with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'android-agent-experiment/1.0'}),timeout=120) as r, dest.open('wb') as out:
+        while True:
+            block=r.read(1024*1024)
+            if not block: break
+            digest.update(block); out.write(block)
+    if digest.hexdigest().lower()!=checksum.lower():
+        dest.unlink(missing_ok=True); raise SetupError('下载文件校验失败；已丢弃文件，请检查网络后重试。')
+
+def safe_tar(archive,dest):
+    root=dest.resolve()
+    with tarfile.open(archive,'r:gz') as tf:
+        for member in tf:
+            target=(root/member.name).resolve()
+            if not target.is_relative_to(root): raise SetupError('压缩包包含越界路径。')
+            if member.issym() or member.islnk():
+                base=target.parent if member.issym() else root
+                if not (base/member.linkname).resolve().is_relative_to(root): raise SetupError('压缩包包含越界链接。')
+            if member.isdev() or member.isfifo(): raise SetupError('压缩包包含不支持的设备文件。')
+            tf.extract(member,root)
+
+def safe_zip(archive,dest):
+    root=dest.resolve()
+    with zipfile.ZipFile(archive) as z:
+        for item in z.infolist():
+            target=(root/item.filename).resolve()
+            if not target.is_relative_to(root): raise SetupError('压缩包包含越界路径。')
+            # Android command-line tools archives contain no links; do not extract one.
+            mode=item.external_attr >> 16
+            if (mode & 0o170000)==0o120000: raise SetupError('压缩包包含不支持的链接。')
+            z.extract(item,root)
+            if mode and target.is_file(): target.chmod(mode & 0o777)
+
+def java_valid(java):
+    if not java: return False
+    try:
+        p=subprocess.run([str(java),'-version'],capture_output=True,text=True,timeout=15)
+        m=re.search(r'version "(\d+)',p.stderr+p.stdout)
+        return p.returncode==0 and bool(m) and 21<=int(m.group(1))<=25
+    except (OSError,subprocess.SubprocessError): return False
+
+def java21(env,cache):
+    candidates=[]
+    if env.get('JAVA_HOME'): candidates.append(pathlib.Path(env['JAVA_HOME'])/'bin/java')
+    if sys.platform=='darwin' and pathlib.Path('/usr/libexec/java_home').exists():
+        p=subprocess.run(['/usr/libexec/java_home','-v','21'],capture_output=True,text=True)
+        if p.returncode==0 and p.stdout.strip(): candidates.append(pathlib.Path(p.stdout.strip())/'bin/java')
+    found=shutil.which('java',path=env.get('PATH'))
+    if found: candidates.append(pathlib.Path(found))
+    cached=cache/'jdk21'; candidates.append(cached/'bin/java')
+    for java in candidates:
+        if java_valid(java):
+            # Resolve Linux alternatives; macOS /usr/bin/java is a system launcher.
+            if sys.platform=='darwin' and str(java)=='/usr/bin/java': env.pop('JAVA_HOME',None)
+            else: env['JAVA_HOME']=str(java.resolve().parent.parent)
+            env['PATH']=str(java.parent)+os.pathsep+env.get('PATH',''); return env
+    system,arch=host(); filename=f'OpenJDK21U-jdk_{arch}_{system}_hotspot_21.0.8_9.tar.gz'
+    base='https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.8%2B9/'
+    print('未发现兼容 JDK，自动下载 Eclipse Temurin JDK 21（约 200 MB）。',flush=True)
+    sha=fetch_bytes(base+filename+'.sha256.txt').decode('ascii').split()[0]
+    with tempfile.TemporaryDirectory(prefix='jdk-',dir=cache) as tmp:
+        tmp=pathlib.Path(tmp); archive=tmp/'jdk.tar.gz'; unpack=tmp/'unpack'; unpack.mkdir()
+        download(base+filename,archive,sha); safe_tar(archive,unpack)
+        matches=list(unpack.glob('*/bin/java'))+list(unpack.glob('*/Contents/Home/bin/java'))
+        if len(matches)!=1 or not java_valid(matches[0]): raise SetupError('下载的 JDK 无法运行或版本不兼容。')
+        source=matches[0].parent.parent
+        if cached.exists(): shutil.rmtree(cached)
+        shutil.move(str(source),str(cached))
+    env['JAVA_HOME']=str(cached); env['PATH']=str(cached/'bin')+os.pathsep+env.get('PATH',''); return env
+
+def node22(env,cache):
+    node=shutil.which('node',path=env.get('PATH')); npm=shutil.which('npm',path=env.get('PATH'))
+    if node and npm:
+        p=subprocess.run([node,'--version'],capture_output=True,text=True)
+        m=re.match(r'v(\d+)',p.stdout.strip())
+        if p.returncode==0 and m and int(m.group(1))>=20: return env
+    cached=cache/'node22'; node=cached/'bin/node'; npm=cached/'bin/npm'
+    if not node.is_file() or not npm.is_file():
+        system,arch=host(); name=f'node-v22.18.0-{"darwin" if system=="mac" else "linux"}-{"arm64" if arch=="aarch64" else "x64"}.tar.gz'
+        base='https://nodejs.org/dist/v22.18.0/'
+        print('未发现兼容 Node.js，自动下载 Node.js 22。',flush=True)
+        sums=fetch_bytes(base+'SHASUMS256.txt').decode('ascii')
+        hashes=[x.split()[0] for x in sums.splitlines() if len(x.split())==2 and x.split()[1]==name]
+        if len(hashes)!=1: raise SetupError('未找到 Node.js 下载包的官方校验值。')
+        with tempfile.TemporaryDirectory(prefix='node-',dir=cache) as tmp:
+            tmp=pathlib.Path(tmp); archive=tmp/'node.tar.gz'; unpack=tmp/'unpack'; unpack.mkdir()
+            download(base+name,archive,hashes[0]); safe_tar(archive,unpack)
+            roots=list(unpack.iterdir())
+            if len(roots)!=1 or not (roots[0]/'bin/node').is_file() or not (roots[0]/'bin/npm').is_file(): raise SetupError('Node.js 下载包结构异常。')
+            if cached.exists(): shutil.rmtree(cached)
+            shutil.move(str(roots[0]),str(cached))
+    env['PATH']=str(cached/'bin')+os.pathsep+env.get('PATH',''); return env
+
+def locate_sdk(cache):
+    candidates=[os.environ.get('ANDROID_SDK_ROOT'),os.environ.get('ANDROID_HOME'),str(pathlib.Path.home()/'Library/Android/sdk'),str(pathlib.Path.home()/'Android/Sdk')]
     for x in candidates:
-        if x and pathlib.Path(x).is_dir(): return pathlib.Path(x).expanduser().resolve()
-    raise SetupError('未找到 Android SDK。请安装 Android Studio、SDK 和 Command-line Tools 后重新运行；不要在聊天中提供密钥。')
+        if x and pathlib.Path(x).is_dir() and os.access(x,os.W_OK): return pathlib.Path(x).expanduser().resolve()
+    sdk=cache/'AndroidSdk'; sdk.mkdir(parents=True,exist_ok=True); return sdk
 
-def tool(sdk, *paths):
+def prepare_sdk_manager(sdk,cache):
+    sdkmanager=sdk/'cmdline-tools/latest/bin/sdkmanager'; avdmanager=sdk/'cmdline-tools/latest/bin/avdmanager'
+    if sdkmanager.is_file() and avdmanager.is_file() and os.access(sdkmanager,os.X_OK) and os.access(avdmanager,os.X_OK): return str(sdkmanager),str(avdmanager)
+    cached=cache/'android-cmdline-tools/latest'
+    if (cached/'bin/sdkmanager').is_file() and (cached/'bin/avdmanager').is_file():
+        return str(cached/'bin/sdkmanager'),str(cached/'bin/avdmanager')
+    print('未发现 Android 命令行工具，自动从 Google 下载。',flush=True)
+    repo='https://dl.google.com/android/repository/'
+    document=ET.fromstring(fetch_bytes(repo+'repository2-1.xml'))
+    package=next((x for x in document if x.get('path')=='cmdline-tools;latest'),None)
+    if package is None: raise SetupError('Google SDK 列表中未找到命令行工具。')
+    host_os='macosx' if host()[0]=='mac' else 'linux'
+    for archive in package.findall('./archives/archive'):
+        if archive.findtext('host-os')==host_os:
+            name=archive.findtext('./complete/url'); checksum=archive.findtext('./complete/checksum'); break
+    else: raise SetupError('Google SDK 列表中没有当前系统对应的命令行工具。')
+    if not name or '/' in name or not checksum: raise SetupError('Google SDK 下载清单格式异常。')
+    with tempfile.TemporaryDirectory(prefix='sdk-',dir=cache) as tmp:
+        tmp=pathlib.Path(tmp); file=tmp/'sdk.zip'; unpack=tmp/'unpack'; unpack.mkdir()
+        download(repo+name,file,checksum,'sha1'); safe_zip(file,unpack)
+        source=unpack/'cmdline-tools'
+        if not (source/'bin/sdkmanager').is_file() or not (source/'bin/avdmanager').is_file(): raise SetupError('Android 命令行工具包结构异常。')
+        cached.parent.mkdir(parents=True,exist_ok=True)
+        if cached.exists(): shutil.rmtree(cached)
+        shutil.move(str(source),str(cached))
+    return str(cached/'bin/sdkmanager'),str(cached/'bin/avdmanager')
+
+def tool(sdk,*paths):
     for path in paths:
-        p = sdk/path
-        if p.is_file() and os.access(p, os.X_OK): return str(p)
-    raise SetupError(f'Android SDK 缺少 {paths[0]}；请在 Android Studio 的 SDK Manager 安装对应组件。')
-
-def java21():
-    env = os.environ.copy()
-    if sys.platform == 'darwin' and pathlib.Path('/usr/libexec/java_home').exists():
-        p = subprocess.run(['/usr/libexec/java_home','-v','21'], capture_output=True, text=True)
-        if p.returncode == 0 and p.stdout.strip():
-            env['JAVA_HOME'] = p.stdout.strip(); env['PATH'] = str(pathlib.Path(env['JAVA_HOME'])/'bin') + os.pathsep + env.get('PATH','')
-    java = shutil.which('java', path=env.get('PATH'))
-    if not java: raise SetupError('未找到 JDK 21；请安装后重试。')
-    p = subprocess.run([java, '-version'],capture_output=True,text=True)
-    match = re.search(r'version "(\d+)', p.stderr + p.stdout)
-    if p.returncode or not match or int(match.group(1)) < 21: raise SetupError('需要 JDK 21 或更高版本。')
-    return env
+        p=sdk/path
+        if p.is_file() and os.access(p,os.X_OK): return str(p)
+    raise SetupError(f'Android SDK 安装后仍缺少 {paths[0]}；请查看准备过程.log。')
 
 def ports(count):
     # Probe both emulator console and adb port; the emulator itself performs the final bind.
@@ -208,28 +329,37 @@ def main():
     try:
         with phase('检查工具与登录'):
             if sys.platform=='darwin': os.environ['PATH']='/opt/homebrew/bin:/usr/local/bin:'+os.environ.get('PATH','')
-            for name in ('git','python3','node','npm'):
-                if not shutil.which(name): raise SetupError(f'缺少 {name}；请安装 Git、Python 3 和 Node.js 20 或更高版本后重试。')
-            version=subprocess.run(['node','--version'],capture_output=True,text=True).stdout.strip()
-            m=re.match(r'v(\d+)',version)
-            if not m or int(m.group(1))<20: raise SetupError('设备操作工具需要 Node.js 20 或更高版本。')
-            image_tool='sips' if sys.platform=='darwin' else 'magick'
-            if not shutil.which(image_tool): raise SetupError(f'缺少截图缩放工具 {image_tool}；请安装 ImageMagick 或使用系统自带 sips。')
-            env=java21(); env['npm_config_cache']=str(root/'npm缓存')
+            for name in ('git','python3'):
+                if not shutil.which(name): raise SetupError(f'缺少 {name}；请先安装后重新运行。')
+            cache=pathlib.Path.home()/'codex-agent-experiments/工具缓存'; cache.mkdir(parents=True,exist_ok=True)
+            env=os.environ.copy(); env['npm_config_cache']=str(cache/'npm缓存')
+            env=java21(env,cache); env=node22(env,cache)
             if not shutil.which('codex',path=env.get('PATH')):
                 print('正在本次实验目录安装 Codex CLI。',flush=True)
                 command(['npm','install','--prefix',str(root/'codex工具'),'--no-audit','--no-fund','@openai/codex'],env=env,logfile=log,timeout=900)
                 env['PATH']=str(root/'codex工具/node_modules/.bin')+os.pathsep+env['PATH']
-                os.environ['PATH']=env['PATH']
-            sdk=locate_sdk(); env['ANDROID_HOME']=str(sdk); env['ANDROID_SDK_ROOT']=str(sdk)
-            adb=tool(sdk,'platform-tools/adb'); emulator=tool(sdk,'emulator/emulator'); sdkmanager=tool(sdk,'cmdline-tools/latest/bin/sdkmanager'); avdmanager=tool(sdk,'cmdline-tools/latest/bin/avdmanager')
+            sdk=locate_sdk(cache); env['ANDROID_HOME']=str(sdk); env['ANDROID_SDK_ROOT']=str(sdk)
+            sdkmanager,avdmanager=prepare_sdk_manager(sdk,cache)
+            abi='arm64-v8a' if os.uname().machine.lower() in ('arm64','aarch64') else 'x86_64'
+            image='system-images;android-34;google_apis;'+abi
+            needed=[]
+            for rel,package in [('platform-tools/adb','platform-tools'),('emulator/emulator','emulator'),('platforms/android-36','platforms;android-36'),('system-images/android-34/google_apis/'+abi,image)]:
+                if not (sdk/rel).exists(): needed.append(package)
+            if needed:
+                print('将自动安装缺少的 Android SDK 组件；如出现许可协议，请在窗口中阅读并选择。',flush=True)
+                command([sdkmanager,'--sdk_root='+str(sdk),'--install',*needed],env=env,interactive=True,timeout=3600)
+            adb=tool(sdk,'platform-tools/adb'); emulator=tool(sdk,'emulator/emulator')
             if subprocess.run(['codex','login','status'],env=env).returncode:
                 print('请按 Codex 提示完成浏览器登录。',flush=True)
                 command(['codex','login'],env=env,interactive=True)
                 command(['codex','login','status'],env=env,interactive=True)
             info['codex_version']=subprocess.run(['codex','--version'],env=env,capture_output=True,text=True).stdout.strip()
             venv=root/'工具环境'; command([sys.executable,'-m','venv',str(venv)],logfile=log)
-            py=venv/'bin/python'; command([str(py),'-m','pip','install','python-docx>=1.1,<2'],logfile=log,env=env,timeout=600)
+            py=venv/'bin/python'; command([str(py),'-m','pip','install','python-docx>=1.1,<2','Pillow>=10,<13'],logfile=log,env=env,timeout=600)
+            if sys.platform!='darwin' and not shutil.which('magick',path=env.get('PATH')):
+                helper=root/'辅助命令'; helper.mkdir()
+                resize=helper/'magick'; resize.write_text('#!'+str(py)+'\nfrom PIL import Image\nimport sys\nif len(sys.argv)!=5 or sys.argv[2]!="-resize": raise SystemExit("仅支持 magick 输入 -resize 宽x高 输出")\nw,h=(int(x) for x in sys.argv[3].split("x")); image=Image.open(sys.argv[1]); image.thumbnail((w,h)); image.save(sys.argv[4])\n'); resize.chmod(0o755)
+                env['PATH']=str(helper)+os.pathsep+env['PATH']
         with phase('准备设备操作服务'):
             command(['npm','install','--prefix',str(root/'设备工具'),'--no-audit','--no-fund','@mobilenext/mobile-mcp@1.0.17'],env=env,logfile=log,timeout=900)
             mcp=root/'设备工具/node_modules/.bin/mcp-server-mobile'
@@ -237,11 +367,6 @@ def main():
             env['ANDROID_EXPERIMENT_MCP_COMMAND']=str(mcp)
             info['device_tool']='@mobilenext/mobile-mcp@1.0.17'
         with phase('准备 Android SDK 与两个模拟器'):
-            abi='arm64-v8a' if os.uname().machine.lower() in ('arm64','aarch64') else 'x86_64'
-            image='system-images;android-34;google_apis;'+abi
-            if not (sdk/'platforms/android-36').is_dir() or not (sdk/'system-images/android-34/google_apis'/abi).is_dir():
-                print('将使用 Android SDK Manager 安装平台 36 和 API 34 模拟器镜像；如出现许可协议，请在此窗口阅读并选择。',flush=True)
-                command([sdkmanager,'--install','platforms;android-36',image],env=env,interactive=True,timeout=1800)
             avdhome=root/'设备数据'; avdhome.mkdir(); env['ANDROID_AVD_HOME']=str(avdhome); env['ANDROID_USER_HOME']=str(root/'android用户数据'); pathlib.Path(env['ANDROID_USER_HOME']).mkdir()
             command([adb,'start-server'],env=env,logfile=log,timeout=30)
             for idx,p in enumerate(ports(2)):
@@ -301,7 +426,7 @@ def main():
             info['status']='Codex 已结束，待人工核对设备使用和 Agent 结果'; code=0
     except KeyboardInterrupt:
         info['status']='用户中断'; info['detail']='实验中断；保留已产生的日志。'; code=130
-    except (SetupError, OSError, subprocess.SubprocessError, ValueError) as e:
+    except (SetupError, OSError, subprocess.SubprocessError, ValueError, tarfile.TarError, zipfile.BadZipFile, ET.ParseError) as e:
         info['status']='未完成'; info['detail']=str(e); print('\n未完成：',e,flush=True); code=1
     finally:
         stop.set()

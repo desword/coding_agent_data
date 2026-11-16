@@ -4,10 +4,10 @@
 
 ## 运行前
 
-- macOS 可直接双击；Linux 可执行 `python3 一键测试.command`。需要联网、Git、Python 3.9+、JDK 21+ 和 Node.js 20+（包含 npm）。若没有 Codex CLI，脚本会在本次实验目录中安装；未登录时按屏幕提示登录。使用有相应模型权限的账号，运行可能产生模型使用费用。
-- 先安装 Android Studio 和 Android SDK，并在 SDK Manager 安装 Android SDK Platform-Tools、Android Emulator、Android SDK Command-line Tools (latest)。设置 `ANDROID_HOME` 或 `ANDROID_SDK_ROOT`；macOS 和 Linux 常用默认路径会自动识别。
-- 计算机需要能够启动 **两台**启用了硬件加速的 Android 模拟器，并有足够内存与磁盘空间。首次运行可能下载多个 GB：脚本会安装 API 36 平台和 API 34 Google APIs 系统镜像，出现 SDK 许可协议时按窗口提示操作。截图缩放依赖 macOS 自带 `sips` 或 Linux 的 ImageMagick `magick`。
-- 首次构建、设备测试和 Agent 开发可能耗时较长。Agent 阶段最多运行两小时。请保持窗口打开；按 Ctrl+C 中断。
+- macOS 下载后双击脚本；Linux 可以运行 `python3 一键测试.command`。需要联网、Git、Python 3.9+ 和可以使用 Codex 的账号。缺少 Python 或 Git 时，需要先安装；未登录 Codex 时按窗口提示登录。模型调用可能产生费用。
+- 脚本会优先复用本机符合要求的 JDK、Node.js 和 Android SDK；缺少时自动下载并校验 JDK 21、Node.js 22、Google 的 SDK 命令行工具，以及应用所需的模拟器组件。Android SDK 的许可协议如出现，请在窗口中阅读并选择。工具缓存保存在 `~/codex-agent-experiments/工具缓存/`，后续运行可复用；如果发现已有可写 Android SDK，也可能向该 SDK 安装缺少的组件。
+- 计算机需要能够启动 **两台**启用了硬件加速的 Android 模拟器，并有足够内存与磁盘空间。首次运行可能下载多个 GB；安装和构建耗时较长。Agent 阶段最多运行两小时，请保持窗口打开；按 Ctrl+C 中断。
+- 网络无法访问下载源、系统不支持硬件加速或权限不足时，脚本会在报告中标明失败；软件自动安装不能代替硬件支持。macOS 首次打开程序如被系统阻止，可在 Finder 中右键脚本选择“打开”。
 
 脚本只操作新下载的独立应用副本，并为本次运行单独创建模拟器与结果目录；运行结束会关闭它启动的模拟器。它不会推送应用代码。设备工具使用固定版本 Mobile MCP，Codex 的模型和账号沿用本机配置。Agent 使用可写工作区沙箱，并允许网络访问以连接本机设备和获取构建依赖。
 
