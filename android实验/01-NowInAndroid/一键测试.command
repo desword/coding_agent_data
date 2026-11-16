@@ -14,14 +14,24 @@ class SetupError(Exception): pass
 
 def command(argv, *, cwd=None, env=None, logfile=None, timeout=None, stdin=None, interactive=False):
     print('\n$', ' '.join(str(x) for x in argv), flush=True)
+    offset=0
     if interactive:
         p = subprocess.run(argv, cwd=cwd, env=env, timeout=timeout, input=stdin, text=True)
     else:
         with open(logfile, 'a', encoding='utf-8') as log:
             log.write('\n$ ' + ' '.join(map(str, argv)) + '\n'); log.flush()
+            offset=os.fstat(log.fileno()).st_size
             p = subprocess.run(argv, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout, input=stdin, text=True)
     if p.returncode:
-        raise SetupError(f'{argv[0]} 返回 {p.returncode}' + (f'，详情见 {logfile}' if logfile else ''))
+        detail=''
+        if logfile:
+            try:
+                with open(logfile,'rb') as log:
+                    log.seek(offset); output=log.read().decode('utf-8',errors='replace')
+                lines=[x.strip() for x in output.replace('\r','\n').splitlines() if x.strip()]
+                detail='；错误输出：'+' | '.join(lines[-12:])[-2000:] if lines else ''
+            except OSError: pass
+        raise SetupError(f'{argv[0]} 返回 {p.returncode}'+detail+(f'；完整日志：{logfile}' if logfile else ''))
     return p
 
 def host():
@@ -138,31 +148,45 @@ def locate_sdk(cache):
     sdk=cache/'AndroidSdk'; sdk.mkdir(parents=True,exist_ok=True); return sdk
 
 def prepare_sdk_manager(sdk,cache):
-    sdkmanager=sdk/'cmdline-tools/latest/bin/sdkmanager'; avdmanager=sdk/'cmdline-tools/latest/bin/avdmanager'
-    if sdkmanager.is_file() and avdmanager.is_file() and os.access(sdkmanager,os.X_OK) and os.access(avdmanager,os.X_OK): return str(sdkmanager),str(avdmanager)
+    # avdmanager infers the SDK root from its own real path, even if ANDROID_HOME is set.
+    # A manager stored in a separate cache can see the wrong package repository.
+    commands=sdk/'cmdline-tools'
+    def usable(directory):
+        manager=directory/'bin/sdkmanager'; avd=directory/'bin/avdmanager'
+        return manager.is_file() and avd.is_file() and os.access(manager,os.X_OK) and os.access(avd,os.X_OK)
+    candidates=[commands/'latest']+sorted(commands.glob('codex-experiment-*'))
+    for candidate in candidates:
+        if usable(candidate) and (candidate/'bin/avdmanager').resolve().parents[3]==sdk.resolve():
+            return str(candidate/'bin/sdkmanager'),str(candidate/'bin/avdmanager')
+    commands.mkdir(parents=True,exist_ok=True)
     cached=cache/'android-cmdline-tools/latest'
-    if (cached/'bin/sdkmanager').is_file() and (cached/'bin/avdmanager').is_file():
-        return str(cached/'bin/sdkmanager'),str(cached/'bin/avdmanager')
-    print('未发现 Android 命令行工具，自动从 Google 下载。',flush=True)
-    repo='https://dl.google.com/android/repository/'
-    document=ET.fromstring(fetch_bytes(repo+'repository2-1.xml'))
-    package=next((x for x in document if x.get('path')=='cmdline-tools;latest'),None)
-    if package is None: raise SetupError('Google SDK 列表中未找到命令行工具。')
-    host_os='macosx' if host()[0]=='mac' else 'linux'
-    for archive in package.findall('./archives/archive'):
-        if archive.findtext('host-os')==host_os:
-            name=archive.findtext('./complete/url'); checksum=archive.findtext('./complete/checksum'); break
-    else: raise SetupError('Google SDK 列表中没有当前系统对应的命令行工具。')
-    if not name or '/' in name or not checksum: raise SetupError('Google SDK 下载清单格式异常。')
-    with tempfile.TemporaryDirectory(prefix='sdk-',dir=cache) as tmp:
-        tmp=pathlib.Path(tmp); file=tmp/'sdk.zip'; unpack=tmp/'unpack'; unpack.mkdir()
-        download(repo+name,file,checksum,'sha1'); safe_zip(file,unpack)
-        source=unpack/'cmdline-tools'
-        if not (source/'bin/sdkmanager').is_file() or not (source/'bin/avdmanager').is_file(): raise SetupError('Android 命令行工具包结构异常。')
-        cached.parent.mkdir(parents=True,exist_ok=True)
-        if cached.exists(): shutil.rmtree(cached)
-        shutil.move(str(source),str(cached))
-    return str(cached/'bin/sdkmanager'),str(cached/'bin/avdmanager')
+    with tempfile.TemporaryDirectory(prefix='.codex-install-',dir=commands) as stage_dir:
+        stage=pathlib.Path(stage_dir); source=stage/'tools'
+        if usable(cached):
+            print('修复 Android 工具目录：复用已下载的缓存，放入当前 SDK。',flush=True)
+            shutil.copytree(cached,source,symlinks=True)
+        else:
+            print('未发现 Android 命令行工具，自动从 Google 下载。',flush=True)
+            repo='https://dl.google.com/android/repository/'
+            document=ET.fromstring(fetch_bytes(repo+'repository2-1.xml'))
+            package=next((x for x in document if x.get('path')=='cmdline-tools;latest'),None)
+            if package is None: raise SetupError('Google SDK 列表中未找到命令行工具。')
+            host_os='macosx' if host()[0]=='mac' else 'linux'
+            for archive in package.findall('./archives/archive'):
+                if archive.findtext('host-os')==host_os:
+                    name=archive.findtext('./complete/url'); checksum=archive.findtext('./complete/checksum'); break
+            else: raise SetupError('Google SDK 列表中没有当前系统对应的命令行工具。')
+            if not name or '/' in name or not checksum: raise SetupError('Google SDK 下载清单格式异常。')
+            file=stage/'sdk.zip'; unpack=stage/'unpack'; unpack.mkdir()
+            download(repo+name,file,checksum,'sha1'); safe_zip(file,unpack)
+            shutil.move(str(unpack/'cmdline-tools'),str(source))
+        if not usable(source): raise SetupError('Android 命令行工具包结构异常或没有执行权限。')
+        # Never overwrite an existing user installation, even if it is incomplete.
+        target=commands/'latest'
+        if target.exists() or target.is_symlink():
+            target=commands/('codex-experiment-'+pathlib.Path(stage_dir).name.removeprefix('.codex-install-'))
+        source.rename(target)
+    return str(target/'bin/sdkmanager'),str(target/'bin/avdmanager')
 
 def tool(sdk,*paths):
     for path in paths:
@@ -277,9 +301,12 @@ def report(root, info):
     e=html.escape
     parts=['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>Android 多 Agent 实验报告</title><style>body{font:16px/1.65 -apple-system,BlinkMacSystemFont,sans-serif;max-width:1000px;margin:40px auto;padding:0 20px;color:#1f2937}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:8px;text-align:left}code{background:#f1f5f9;padding:2px 4px}</style><h1>Android 多 Agent 实验报告</h1>']
     parts.append('<p>运行状态：<b>'+e(str(info.get('status','未知')))+'</b>。 '+e(str(info.get('detail','')))+'</p>')
+    if info.get('failed_stage'): parts.append('<p>失败阶段：'+e(str(info['failed_stage']))+'</p>')
     parts.append('<p>应用和基线：Now in Android <code>'+APP_REV+'</code>；公开工作流：Android Bug Priority Tree <code>'+FLOW_REV+'</code>。应用与流程的组合、设备槽位属于本实验配置。</p>')
-    parts.append('<h2>阶段耗时</h2><table><tr><th>阶段</th><th>秒</th><th>状态</th></tr>')
-    for p in info.get('phases',[]): parts.append('<tr><td>'+e(p['name'])+'</td><td>'+str(p['seconds'])+'</td><td>'+e(p['status'])+'</td></tr>')
+    parts.append('<h2>正式开发耗时</h2><p>只计 Codex 多 Agent 正式任务从启动到结束的时间；环境安装、下载、模拟器准备、基线构建和报告生成均不计入。工具调用时间可互相重叠，不能相加得到总耗时。</p><table><tr><th>阶段</th><th>秒</th><th>状态</th></tr>')
+    if 'formal_elapsed_seconds' in info:
+        parts.append('<tr><td>Codex 多 Agent 正式任务</td><td>'+e(str(info['formal_elapsed_seconds']))+'</td><td>'+e(str(info.get('formal_status','未知')))+'</td></tr>')
+    else: parts.append('<tr><td colspan="3">尚未启动或未获得正式任务的有效计时，不能计算开发耗时。</td></tr>')
     parts.append('</table><h2>可识别消息正文</h2><p>按工具调用参数及支持格式的完成结果提取；调用不保证送达，未识别记录不等于零。明细包含发送方、接收方和来源行。自动通知、继承上下文、日志不支持的格式可能遗漏。</p><table><tr><th>事件</th><th>条数</th><th>正文 UTF-8 字节</th></tr>')
     for k,(n,b) in sorted(counts.items()): parts.append(f'<tr><td>{e(k)}</td><td>{n}</td><td>{b}</td></tr>')
     if not counts: parts.append('<tr><td colspan="3">没有可识别记录；不能据此判断真实通信量为零。</td></tr>')
@@ -316,16 +343,14 @@ def main():
     if sys.version_info < (3,9): raise SetupError('需要 Python 3.9 或更新版本。')
     root=pathlib.Path.home()/'codex-agent-experiments'/('android01-'+dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
     root.mkdir(parents=True,exist_ok=False); print('本次实验目录：',root,flush=True)
-    log=root/'准备过程.log'; info={'status':'准备中','app_url':APP_URL,'app_commit':APP_REV,'workflow_url':FLOW_URL,'workflow_commit':FLOW_REV,'phases':[],'devices':[],'started_utc':dt.datetime.now(dt.timezone.utc).isoformat()}
+    log=root/'准备过程.log'; info={'status':'准备中','app_url':APP_URL,'app_commit':APP_REV,'workflow_url':FLOW_URL,'workflow_commit':FLOW_REV,'devices':[],'launcher_started_utc':dt.datetime.now(dt.timezone.utc).isoformat()}
     processes=[]; files=[]; stop=threading.Event(); sampler=None; code=1
     @contextlib.contextmanager
     def phase(name):
-        print('\n【'+name+'】',flush=True); start=time.monotonic(); item={'name':name,'seconds':0,'status':'进行中'}; info['phases'].append(item)
+        print('\n【'+name+'】',flush=True)
         try: yield
         except BaseException:
-            item['status']='失败或中断'; raise
-        else: item['status']='完成'
-        finally: item['seconds']=round(time.monotonic()-start,3)
+            info['failed_stage']=name; raise
     try:
         with phase('检查工具与登录'):
             if sys.platform=='darwin': os.environ['PATH']='/opt/homebrew/bin:/usr/local/bin:'+os.environ.get('PATH','')
@@ -418,8 +443,12 @@ def main():
             env['PATH']=str(sdk/'platform-tools')+os.pathsep+str(sdk/'emulator')+os.pathsep+env['PATH']
             p=subprocess.run([str(py),str(runner),'--project',str(project),'--mode','write','--timeout','7200','--prompt',str(root/'本次任务.txt'),'--output',str(root/'记录')],env=env)
             info['codex_exit_code']=p.returncode
+            meta_path=root/'记录/实验信息.json'
+            meta=json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+            if meta.get('exit_code')!=127 and isinstance(meta.get('elapsed_seconds'),(int,float)):
+                info['formal_elapsed_seconds']=meta['elapsed_seconds']
+                info['formal_status']='完成' if not p.returncode else '失败或中断'
             if p.returncode: raise SetupError(f'Codex 未成功完成（退出码 {p.returncode}）；请查看 记录/codex-stderr.log。')
-            meta=json.loads((root/'记录/实验信息.json').read_text(encoding='utf-8'))
             info['session_count']=meta.get('session_count',0); info['recognized_messages']=meta.get('recognized_messages',0)
             if info['session_count']<3 or info['recognized_messages']<1:
                 raise SetupError('未关联到至少两个子会话或未识别到协作消息；不能判定多 Agent 测试完成，请检查原始会话。')

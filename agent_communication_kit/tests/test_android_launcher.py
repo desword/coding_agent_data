@@ -37,6 +37,38 @@ class Integration(unittest.TestCase):
     entry=tarfile.TarInfo('../escape'); entry.size=1; tf.addfile(entry,io.BytesIO(b'x'))
    with self.assertRaises(module.SetupError): module.safe_tar(archive,dest)
    self.assertFalse((base/'escape').exists())
+ def test_cached_avdmanager_is_migrated_inside_sdk(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   base=pathlib.Path(tmp); cache=base/'cache'; sdk=base/'sdk'; cache.mkdir(); sdk.mkdir()
+   old=cache/'android-cmdline-tools/latest'
+   for name in ('sdkmanager','avdmanager'): executable(old/'bin'/name,'#!/bin/sh\nexit 0\n')
+   with mock.patch.object(module,'fetch_bytes',side_effect=AssertionError('cached tools should be reused')):
+    manager,avd=module.prepare_sdk_manager(sdk,cache)
+   self.assertEqual(pathlib.Path(avd).resolve().parents[3],sdk.resolve())
+   self.assertTrue((old/'bin/avdmanager').exists())
+   self.assertEqual(module.prepare_sdk_manager(sdk,cache),(manager,avd))
+ def test_incomplete_user_cmdline_tools_are_preserved(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   base=pathlib.Path(tmp); cache=base/'cache'; sdk=base/'sdk'; cache.mkdir(); sdk.mkdir()
+   marker=sdk/'cmdline-tools/latest/keep.txt'; marker.parent.mkdir(parents=True); marker.write_text('keep')
+   old=cache/'android-cmdline-tools/latest'
+   for name in ('sdkmanager','avdmanager'): executable(old/'bin'/name,'#!/bin/sh\nexit 0\n')
+   _,avd=module.prepare_sdk_manager(sdk,cache)
+   self.assertEqual(marker.read_text(),'keep')
+   self.assertEqual(pathlib.Path(avd).resolve().parents[3],sdk.resolve())
+ def test_report_has_no_development_time_before_codex(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   out=pathlib.Path(tmp)
+   module.report(out,{'status':'未完成','failed_stage':'准备设备','detail':'测试失败'})
+   report=(out/'实验报告.html').read_text()
+   self.assertIn('尚未启动或未获得正式任务的有效计时',report)
+   self.assertIn('准备设备',report)
+   self.assertNotIn('Codex 多 Agent 正式任务</td>',report)
+ def test_failed_command_includes_original_error(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   with self.assertRaises(module.SetupError) as failure:
+    module.command([sys.executable,'-c',"import sys; print('specific error',file=sys.stderr); sys.exit(1)"],logfile=pathlib.Path(tmp)/'run.log')
+   self.assertIn('specific error',str(failure.exception))
  def test_root_shortcut_points_to_case_script(self):
   shortcut=ROOT/'一键启动多Agent实验.command'
   self.assertTrue(shortcut.is_symlink())
@@ -95,6 +127,9 @@ print('2026-01-01T00:00:00.030Z codex_otel.agent_communication: communication_id
    with mock.patch.dict(os.environ,env,clear=False),mock.patch.object(module,'command',side_effect=wrapped),mock.patch.object(module.os,'uname',return_value=type('U',(),{'machine':'x86_64'})()):
     self.assertEqual(module.main(),0)
    out=next((home/'codex-agent-experiments').glob('android01-*')); info=json.loads((out/'实验状态.json').read_text());
+   self.assertIn('formal_elapsed_seconds',info); self.assertNotIn('phases',info)
+   self.assertIn('正式开发耗时',(out/'实验报告.html').read_text())
+   self.assertNotIn('检查工具与登录',(out/'实验报告.html').read_text())
    self.assertEqual(info['session_count'],3); self.assertEqual(info['recognized_messages'],2); self.assertEqual(info['telemetry_events_matched'],1)
    self.assertEqual([d['baseline_tests'] for d in info['devices']],[3,3]); self.assertTrue((out/'实验报告.html').exists())
    self.assertIn('30.000 ms',(out/'实验报告.html').read_text())
