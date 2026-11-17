@@ -6,7 +6,7 @@
 
 当前更严格的通信瓶颈复筛和公开轨迹分析见 [真实项目通信瓶颈复筛](多Agent-Coding场景研究/真实项目通信瓶颈复筛.md)。
 
-新的测试顺序和项目登记见 [浏览器相关项目登记](多Agent-Coding场景研究/项目登记与测试顺序.md)。 两项任务的 [10 Gbps 跨服务器通信拥塞推演](多Agent-Coding场景研究/两个项目10Gbps通信拥塞推演.md) 包含服务器配置、流量条件和合理性分析。首个浏览器案例采用 [Dillo 与 Codex 的测试计划](多Agent-Coding场景研究/02-Dillo浏览器/README.md)：基线已验证，一键脚本和真实多 Agent 运行尚未完成。
+新的测试顺序和项目登记见 [浏览器相关项目登记](多Agent-Coding场景研究/项目登记与测试顺序.md)。 两项任务的 [10 Gbps 跨服务器通信拥塞推演](多Agent-Coding场景研究/两个项目10Gbps通信拥塞推演.md) 包含服务器配置、流量条件和合理性分析。首个浏览器案例采用 [Dillo 与 Codex 的测试计划](多Agent-Coding场景研究/02-Dillo浏览器/README.md)：基线已验证，已提供 [Mac 一键启动脚本](多Agent-Coding场景研究/02-Dillo浏览器/Mac/一键启动.command)；Mac 实机和真实多 Agent 完整运行待验证。
 
 原有的 [房间预订 API 实验计划](多Agent-Coding场景研究/01-房间预订API/README.md) 保留为协调机制基准。
 
