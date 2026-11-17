@@ -87,6 +87,27 @@ class DilloStandaloneTest(unittest.TestCase):
   self.assertTrue(all(r['sender']=='leader' and float(r['sender_to_client_ms'])>=0 for r in rows))
   with (self.root/'记录/每秒通信速率.csv').open(encoding='utf-8-sig',newline='') as f:bw=list(csv.DictReader(f))
   self.assertTrue(any(int(r['delivered_messages']) for r in bw))
+  self.assertEqual(sum(int(r['leader_to_worker_offered_copies']) for r in bw),3)
+  self.assertEqual(sum(int(r['leader_to_worker_offered_bytes']) for r in bw),2*len('接口变更 α'.encode())+len('仅发给当前订阅者'.encode()))
+  self.assertEqual(sum(int(r['worker_to_leader_offered_bytes']) for r in bw),0)
+  self.assertTrue((self.root/'记录/系统内存采样.csv').exists())
+ def test_mac_host_counters_are_collected_without_assuming_free_memory(self):
+  def command(args,**kwargs):
+   values={'hw.physicalcpu':'4','hw.memsize':str(32*1024**3),'vm.swapusage':'total = 1024M  used = 12M  free = 1012M'}
+   output='Mach Virtual Memory Statistics: (page size of 4096 bytes)\nPages free: 120.\n' if args[0]=='vm_stat' else values[args[-1]]
+   return subprocess.CompletedProcess(args,0,output,'')
+  with mock.patch.object(mod.sys,'platform','darwin'),mock.patch.object(mod.subprocess,'run',side_effect=command):
+   host=mod.host_profile();snapshot=mod.system_snapshot()
+  self.assertEqual(host['physical_cpus'],4);self.assertEqual(host['memory_bytes'],32*1024**3)
+  self.assertIn('used = 12M',snapshot['swap_usage']);self.assertIn('Pages free: 120.',snapshot['vm_stat'])
+ def test_directional_offered_load_includes_unacknowledged_messages(self):
+  self.state.start_ns=time.monotonic_ns()
+  self.cli('W1','send','--to','leader','--text','等待 Leader 领取')
+  self.state.end_ns=time.monotonic_ns();mod.make_report(self.state,{'status':'test','checks':{}})
+  with (self.root/'记录/每秒通信速率.csv').open(encoding='utf-8-sig',newline='') as f:rows=list(csv.DictReader(f))
+  self.assertEqual(sum(int(r['worker_to_leader_offered_bytes']) for r in rows),len('等待 Leader 领取'.encode()))
+  self.assertEqual(sum(int(r['worker_to_leader_offered_copies']) for r in rows),1)
+  self.assertEqual(sum(int(r['delivered_messages']) for r in rows),0)
  def test_independent_processes_and_fake_is_not_success(self):
   self.state.start_ns=time.monotonic_ns();self.state.launch('leader','fixture prompt')
   sampler=threading.Thread(target=mod.sample_resources,args=(self.state,.3),daemon=True);sampler.start()

@@ -23,7 +23,7 @@ fi
 exec python3 "$0" "$@"
 ':'''
 from __future__ import annotations
-import argparse, collections, contextlib, csv, datetime as dt, fcntl, html, http.server, json, math, os, pathlib, re, secrets, selectors, shlex, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
+import argparse, collections, contextlib, csv, datetime as dt, fcntl, html, http.server, json, math, os, pathlib, platform, re, secrets, selectors, shlex, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
 
 APP_URL='https://github.com/dillo-browser/dillo.git'
 APP_REV='6856c5016de8cc15d077ec8d785bac1a38b4a813'
@@ -45,6 +45,27 @@ def redacted(s):
     s=re.sub(r'\bsk-[A-Za-z0-9_*-]{4,}','[隐藏]',s)
     return s[-1800:]
 def mkdir(p): p.mkdir(parents=True,exist_ok=True); return p
+
+def system_snapshot():
+    """Best-effort host memory counters; empty values mean unavailable."""
+    result={'utc':stamp(),'mono_ns':time.monotonic_ns(),'swap_usage':'','vm_stat':''}
+    if sys.platform=='darwin':
+        for key,cmd in (('swap_usage',['sysctl','-n','vm.swapusage']),('vm_stat',['vm_stat'])):
+            try:
+                p=subprocess.run(cmd,capture_output=True,text=True,timeout=5)
+                if p.returncode==0:result[key]=p.stdout.strip()
+            except (OSError,subprocess.SubprocessError):pass
+    return result
+
+def host_profile():
+    result={'system':platform.system(),'release':platform.release(),'machine':platform.machine(),'logical_cpus':os.cpu_count(),'physical_cpus':None,'memory_bytes':None}
+    if sys.platform=='darwin':
+        for key,name in (('physical_cpus','hw.physicalcpu'),('memory_bytes','hw.memsize')):
+            try:
+                p=subprocess.run(['sysctl','-n',name],capture_output=True,text=True,timeout=5)
+                if p.returncode==0:result[key]=int(p.stdout.strip())
+            except (OSError,ValueError,subprocess.SubprocessError):pass
+    return result
 
 @contextlib.contextmanager
 def heartbeat(message):
@@ -300,7 +321,7 @@ class State:
         self.root=root;self.repos=repos;self.codex=codex;self.env=env;self.control=control;self.cc=cc;self.model=None
         self.lock=threading.RLock();self.changed=threading.Condition(self.lock);self.git_lock=threading.Lock()
         self.queues={r:collections.deque() for r in ('leader',)+ROLES}
-        self.subs={r:set() for r in ROLES};self.messages={};self.events=[];self.procs={};self.runs={};self.tool_times=[];self.token_usage=[];self.sample_rows=[]
+        self.subs={r:set() for r in ROLES};self.messages={};self.events=[];self.procs={};self.runs={};self.tool_times=[];self.token_usage=[];self.sample_rows=[];self.system_rows=[]
         self.start_ns=0;self.end_ns=0;self.stop=threading.Event();self.agent_tools={};self.watchers=[];self.metrics_endpoints={};self.telemetry_enabled=False
         self.raw=mkdir(root/'记录');self.eventfile=(self.raw/'路由事件.jsonl').open('a',encoding='utf-8')
     def record(self,event):
@@ -592,7 +613,7 @@ def parse_ps_time(text):
     except (ValueError,TypeError):return None
 
 def sample_resources(state,interval=1):
-    previous={};previous_t=None
+    previous={};previous_t=None;next_system=0
     while not state.stop.is_set():
         started=time.monotonic();sample_ns=time.monotonic_ns()
         try:
@@ -623,6 +644,10 @@ def sample_resources(state,interval=1):
                 with state.lock:state.sample_rows.append(row)
             previous={pid:cpu for pid,(_,cpu,_) in processes.items() if pid in owners};previous_t=started
         except (OSError,ValueError,subprocess.SubprocessError) as e:state.record({'event':'sample_error','error':redacted(e)})
+        if started>=next_system:
+            snapshot=system_snapshot()
+            with state.lock:state.system_rows.append(snapshot)
+            next_system=started+5
         state.stop.wait(max(.1,interval-(time.monotonic()-started)))
 
 ACCEPTANCE=r'''
@@ -767,7 +792,7 @@ def percentile(vals):
 def make_report(state,info):
     root=state.root; rec=state.raw
     with state.lock:
-        messages=list(state.messages.values());events=list(state.events);runs=dict(state.runs);samples=list(state.sample_rows);tools=list(state.tool_times);usage=list(state.token_usage)
+        messages=list(state.messages.values());events=list(state.events);runs=dict(state.runs);samples=list(state.sample_rows);system_samples=list(state.system_rows);tools=list(state.tool_times);usage=list(state.token_usage)
     end=state.end_ns or time.monotonic_ns();elapsed=(end-state.start_ns)/1e9 if state.start_ns else None
     fields=['id','kind','sender','receiver','topic','body_bytes','text','sender_to_service_ms','service_route_ms','queue_ms','service_to_client_ms','sender_to_client_ms','delivery_status']
     rows=[]
@@ -780,6 +805,7 @@ def make_report(state,info):
     subscriptions=[x for x in events if x.get('event') in ('subscribe','unsubscribe')]
     write_csv(rec/'订阅事件.csv',['utc','mono_ns','agent','event','topic','origin'],subscriptions)
     write_csv(rec/'每Agent资源.csv',['utc','mono_ns','agent','processes','rss_kib','cpu_percent','note'],samples)
+    write_csv(rec/'系统内存采样.csv',['utc','mono_ns','swap_usage','vm_stat'],system_samples)
     write_csv(rec/'工具耗时.csv',['agent','item_id','kind','duration_ms','event'],tools)
     gitops=[x for x in events if x.get('event')=='git_operation']
     write_csv(rec/'Git操作耗时.csv',['utc','agent','operation','duration_ms','exit_code'],gitops)
@@ -789,19 +815,24 @@ def make_report(state,info):
     model_hist=[]
     for role in ('leader',)+ROLES:model_hist.extend(metrics_from_otlp(rec/(role+'-模型指标.jsonl'),role))
     write_csv(rec/'模型指标汇总.csv',['agent','metric','count','sum_ms','average_ms','min_ms','max_ms','source'],model_hist)
-    bins=collections.defaultdict(lambda:{'request_body_bytes':0,'response_body_bytes':0,'delivered_text_bytes':0,'delivered_messages':0})
+    bins=collections.defaultdict(lambda:{'request_body_bytes':0,'response_body_bytes':0,'delivered_text_bytes':0,'delivered_messages':0,'worker_to_leader_offered_bytes':0,'leader_to_worker_offered_bytes':0,'worker_to_leader_offered_copies':0,'leader_to_worker_offered_copies':0})
     for e in events:
         if not state.start_ns:continue
         sec=max(0,(e['mono_ns']-state.start_ns)//1_000_000_000)
         if e['event']=='http':
             bins[sec]['request_body_bytes']+=e.get('request_body_bytes',0);bins[sec]['response_body_bytes']+=e.get('response_body_bytes',0)
+        elif e['event']=='enqueue':
+            direction=('worker_to_leader' if e.get('sender') in ROLES and e.get('receiver')=='leader' else ('leader_to_worker' if e.get('sender')=='leader' and e.get('receiver') in ROLES else None))
+            if direction:
+                bins[sec][direction+'_offered_bytes']+=e.get('body_bytes',0)
+                bins[sec][direction+'_offered_copies']+=1
         elif e['event']=='receive_ack':
             m=state.messages.get(e.get('id'))
             if m:bins[sec]['delivered_text_bytes']+=m['body_bytes'];bins[sec]['delivered_messages']+=1
     bw=[]
     for sec in range(math.ceil(elapsed or 0)):
         b=bins[sec];bw.append({'second':sec,**b,'http_json_mbps':round((b['request_body_bytes']+b['response_body_bytes'])*8/1e6,6),'delivered_text_mbps':round(b['delivered_text_bytes']*8/1e6,6)})
-    write_csv(rec/'每秒通信速率.csv',['second','request_body_bytes','response_body_bytes','delivered_text_bytes','delivered_messages','http_json_mbps','delivered_text_mbps'],bw)
+    write_csv(rec/'每秒通信速率.csv',['second','request_body_bytes','response_body_bytes','delivered_text_bytes','delivered_messages','http_json_mbps','delivered_text_mbps','worker_to_leader_offered_bytes','worker_to_leader_offered_copies','leader_to_worker_offered_bytes','leader_to_worker_offered_copies'],bw)
     checks=info.get('checks') or {}; good=[r for r in rows if r['delivery_status']=='客户端已领取并确认'];parts=[]
     e=html.escape
     def para(s):parts.append('<p>'+e(str(s))+'</p>')
@@ -815,6 +846,8 @@ def make_report(state,info):
     para('运行状态：'+str(info.get('status','未完成'))+'。'+str(info.get('detail','')))
     para('应用：Dillo '+APP_REV+'；使用独立 Codex CLI Leader 与 Worker、本实验本机路由服务；不是 Codex 原生子 Agent 通道，也不是 Cursor 原始实验。')
     para('Codex 版本：'+str(info.get('codex_version','未知'))+'；正式任务模型：'+str(info.get('model_selection','未知'))+'；本机 OTLP 遥测：'+('启用' if info.get('otel_local_enabled') else '未启用或未通过检查')+'。')
+    host=info.get('host',{})
+    para('主机：'+str(host.get('machine','未知'))+'；物理 CPU 核心 '+str(host.get('physical_cpus') or '不可得')+'；逻辑 CPU '+str(host.get('logical_cpus') or '不可得')+'；内存 '+(f"{host['memory_bytes']/1024**3:.1f} GiB" if host.get('memory_bytes') else '不可得')+'。系统内存原始计数每约 5 秒采集，见记录/系统内存采样.csv；准备结束的快照见实验状态.json。')
     para('正式任务耗时：'+(f'{elapsed:.3f} 秒（从 Leader 启动到开发及最终验证结束）' if elapsed is not None else '未开始')+'。下载、安装、登录、基线测试不计入。')
     heading('正式任务阶段耗时')
     stage=[]
@@ -859,6 +892,13 @@ def make_report(state,info):
     req=sum(b['request_body_bytes'] for b in bw);resp=sum(b['response_body_bytes'] for b in bw);delivered=sum(r['body_bytes'] for r in good)
     table(['指标','结果'],[['路由 HTTP 请求 JSON 正文',f'{req:,} 字节'],['路由 HTTP 响应 JSON 正文',f'{resp:,} 字节'],['成功领取的消息正文副本',f'{delivered:,} 字节'],['HTTP JSON 正文全周期平均',f'{(req+resp)*8/(elapsed or 1)/1e6:.6f} Mbps' if elapsed else '不可得'],['HTTP JSON 正文单秒峰值',f'{max((x["http_json_mbps"] for x in bw),default=0):.6f} Mbps' if bw else '不可得']])
     para('每秒通信速率.csv 给出应用层 JSON 与消息正文；包含客户端与路由服务的本机 HTTP 正文，不含遥测导出、HTTP 头、TCP、重传与物理网卡流量。上下行相加是本地应用层工作量，不能与 10 Gbps 全双工单方向链路直接比较。')
+    directional=[]
+    for key,label in [('worker_to_leader','Worker → Leader'),('leader_to_worker','Leader → Worker')]:
+        n=sum(b[key+'_offered_bytes'] for b in bw);copies=sum(b[key+'_offered_copies'] for b in bw)
+        peak=max((b[key+'_offered_bytes'] for b in bw),default=0)*8/1e6
+        directional.append([label,copies,f'{n:,}',f'{n*8/(elapsed or 1)/1e6:.6f}' if elapsed else '不可得',f'{peak:.6f}'])
+    table(['方向','入队副本数','入队正文 B','全周期平均 Mbps','固定单秒峰值 Mbps'],directional)
+    para('上表按服务入队时间、每个接收者一份统计提交的正文负载，包含尚未领取的消息；Topic 扇出按接收者分别计算。它用于容量估算，不含初始提示、JSON 信封和真实网络协议，不代表实际物理链路吞吐。固定单秒峰值可能低估跨秒突发。')
     heading('延迟拆分')
     latency=[]
     for col,label in [('sender_to_service_ms','客户端发送至服务接收'),('service_route_ms','服务路由入队'),('queue_ms','入队至接收方轮询领取（含等待）'),('service_to_client_ms','服务出队至客户端收到（含本机调度）'),('sender_to_client_ms','发送至客户端收到（含排队及调度）')]:
@@ -1005,6 +1045,7 @@ def main():
         state=State(root,repos,codex,env,None,cc);state.model=selected_model
         server=serve(state)
         state.telemetry_enabled=probe_telemetry(state);info['otel_local_enabled']=state.telemetry_enabled
+        info['host']=host_profile();info['system_before_formal']=system_snapshot()
         emit('\n【正式开发：Leader 分派、5 个 Worker 并发开发】')
         info['detail']='正在进行正式开发。';write_json(root/'实验状态.json',info)
         state.start_ns=time.monotonic_ns()
