@@ -8,11 +8,15 @@ spec=importlib.util.spec_from_loader(loader.name,loader)
 mod=importlib.util.module_from_spec(spec);loader.exec_module(mod)
 
 FAKE_CODEX=r'''#!/usr/bin/env python3
-import json, os, pathlib, sys, time, urllib.request
+import json, os, pathlib, sys, time, urllib.request, subprocess
 if '--help' in sys.argv: print('--no-daemon');raise SystemExit(0)
 if '--version' in sys.argv: print('codex-fixture');raise SystemExit(0)
 if 'login' in sys.argv: print('fixture');raise SystemExit(0)
-if '-' not in sys.argv: print(json.dumps({'type':'turn.completed'}));raise SystemExit(0)
+if '-' not in sys.argv:
+ if 'shell 工具执行' in sys.argv[-1]:
+  subprocess.run(sys.argv[-1].split('\n')[-1],shell=True,check=True)
+  print(json.dumps({'type':'item.completed','item':{'type':'command_execution','exit_code':0}}))
+ print(json.dumps({'type':'turn.completed'}));raise SystemExit(0)
 sys.stdin.read()
 os.chdir(sys.argv[sys.argv.index('-C')+1])
 cfg=json.loads(pathlib.Path('.experiment-build/control.json').read_text()); role=cfg['role']
@@ -158,6 +162,11 @@ class DilloStandaloneTest(unittest.TestCase):
   path.write_text(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'无法执行工具 token=abc123secret'}})+'\n')
   result=mod.leader_diagnostics(self.root/'记录')
   self.assertIn('无法执行工具',result);self.assertNotIn('abc123secret',result)
+ def test_shell_preflight_requires_real_marker(self):
+  mod.probe_shell(self.state)
+  self.assertFalse((self.repos['leader']/'.experiment-build/shell-preflight.txt').exists())
+  self.fake.write_text('#!/usr/bin/env python3\nprint(\'{"type":"turn.completed"}\')\n');self.fake.chmod(0o755)
+  with self.assertRaises(mod.ExperimentError):mod.probe_shell(self.state)
  def test_invalid_api_key_uses_isolated_login_for_retry(self):
   self.fake.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys

@@ -32,6 +32,8 @@ TOPICS=('download/contract','download/parser','download/security','download/inte
 WRITE_PATHS={'W1':('src/misc.h','dlib/'),'W2':('test/unit/disposition.c',),'W3':('test/unit/disposition_security.c',),'W4':('test/unit/disposition_http_test.py',),'leader':('src/misc.h','dlib/','test/unit/disposition.c','test/unit/disposition_security.c','test/unit/disposition_http_test.py')}
 TIMEOUT=7200
 MAX_MESSAGE=262144
+# Use the standard shell tool; standalone releases may lack the code-mode host.
+SHELL_FLAGS=['--disable','code_mode','--disable','code_mode_only','--enable','shell_tool']
 
 class ExperimentError(Exception): pass
 
@@ -464,7 +466,7 @@ class State:
             if role in self.procs:raise ValueError('该角色已经启动。')
             out=(self.raw/(role+'-events.jsonl')).open('w',encoding='utf-8');err=(self.raw/(role+'-stderr.log')).open('w',encoding='utf-8')
             # Separate CLI process, no native child agents or shared daemon.
-            args=[self.codex,'--no-daemon','-a','never','exec','--json','--disable','multi_agent','--sandbox','workspace-write','-c','sandbox_workspace_write.network_access=true','-C',str(self.repos[role]),'-']
+            args=[self.codex,'--no-daemon','-a','never','exec','--json','--disable','multi_agent',*SHELL_FLAGS,'--sandbox','workspace-write','-c','sandbox_workspace_write.network_access=true','-C',str(self.repos[role]),'-']
             if self.model:args[-1:-1]=['--model',self.model]
             if self.telemetry_enabled:args[-1:-1]=['-c',telemetry_config(self.metrics_endpoints[role])]
             try:process=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=err,env=self.env,start_new_session=True,text=True,bufsize=1)
@@ -1017,6 +1019,38 @@ def probe_telemetry(state):
         emit('[模型] 当前版本不支持此遥测配置，将保留原始事件；详情见记录/模型遥测检查.log。');return False
     emit('[模型] 遥测配置可用；实际服务端是否返回推理指标由结果决定。');return True
 
+def probe_shell(state):
+    emit('[工具] 正在验证 Codex 能在实验工作区实际执行 shell；该步骤不计入正式耗时。')
+    marker=state.repos['leader']/'.experiment-build'/'shell-preflight.txt'
+    marker.unlink(missing_ok=True)
+    token=secrets.token_hex(16)
+    command='printf %s '+shlex.quote(token)+' > '+shlex.quote(str(marker))
+    args=[state.codex,'--no-daemon','-a','never','exec','--json','--disable','multi_agent',*SHELL_FLAGS,'--sandbox','workspace-write','-c','sandbox_workspace_write.network_access=true','-C',str(state.repos['leader'])]
+    if state.model:args.extend(['--model',state.model])
+    args.append('请使用 shell 工具执行以下命令，不要修改命令，然后结束：\n'+command)
+    out=state.raw/'工具执行检查.jsonl';err=state.raw/'工具执行检查.log'
+    with out.open('w',encoding='utf-8') as f,err.open('w',encoding='utf-8') as e:
+        p=subprocess.Popen(args,stdin=subprocess.DEVNULL,stdout=f,stderr=e,start_new_session=True)
+        start=time.monotonic();notice=start
+        while p.poll() is None:
+            time.sleep(.5);now=time.monotonic()
+            if now-start>180:stop_group(p);raise ExperimentError('Codex 工具执行检查超时；请查看记录/工具执行检查.jsonl 和 .log。')
+            if now-notice>=15:emit('[工具] 正在检查 shell 执行，已耗时 '+clock(now-start));notice=now
+    try:valid=marker.read_text(encoding='utf-8')==token
+    except OSError:valid=False
+    finally:marker.unlink(missing_ok=True)
+    command_seen=False
+    for line in out.read_text(encoding='utf-8',errors='replace').splitlines():
+        try:event=json.loads(line)
+        except ValueError:continue
+        if not isinstance(event,dict):continue
+        item=event.get('item') or {}
+        if isinstance(item,dict) and event.get('type')=='item.completed' and item.get('type')=='command_execution' and item.get('exit_code')==0:command_seen=True
+    if p.returncode or not valid or not command_seen:
+        detail=model_error(out) or redacted(err.read_text(encoding='utf-8',errors='replace')[-1200:])
+        raise ExperimentError('Codex 未通过实际 shell 执行检查；请查看记录/工具执行检查.jsonl 和 .log。'+detail)
+    emit('[工具] Codex shell 实际执行检查通过。')
+
 def completion_result(state,checks):
     actual=set(state.procs)-{'leader'}
     unsuccessful=[r for r in ('leader',)+ROLES if r not in state.runs or state.runs[r].get('exit_code')!=0 or state.runs[r].get('terminal_event')!='turn.completed']
@@ -1086,6 +1120,7 @@ def main():
         state=State(root,repos,codex,env,None,cc);state.model=selected_model
         server=serve(state)
         state.telemetry_enabled=probe_telemetry(state);info['otel_local_enabled']=state.telemetry_enabled
+        probe_shell(state)
         info['host']=host_profile();info['system_before_formal']=system_snapshot()
         emit('\n【正式开发：Leader 分派、5 个 Worker 并发开发】')
         info['detail']='正在进行正式开发。';write_json(root/'实验状态.json',info)
