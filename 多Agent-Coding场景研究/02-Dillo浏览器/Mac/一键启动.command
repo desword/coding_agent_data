@@ -40,7 +40,13 @@ class ExperimentError(Exception): pass
 def stamp(): return dt.datetime.now(dt.timezone.utc).isoformat(timespec='milliseconds')
 def clock(s):
     s=max(0,int(s)); return '%02d:%02d:%02d'%(s//3600,(s//60)%60,s%60)
-def emit(s): print(s,flush=True)
+PREPARATION_LOG=None
+def emit(s):
+    print(s,flush=True)
+    if PREPARATION_LOG:
+        try:
+            with PREPARATION_LOG.open('a',encoding='utf-8') as f:f.write(redacted(s)+'\n')
+        except OSError:pass
 def redacted(s):
     s=re.sub(r'(?i)(bearer\s+)[^\s,;"\']+',r'\1[隐藏]',str(s))
     s=re.sub(r'(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|password|secret)\b(\s*[=:]\s*["\']?)[^\s,;"\']+',r'\1\2[隐藏]',s)
@@ -163,12 +169,19 @@ def extract_codex_pair(archive, destination, main_name):
     return False
 
 def fetch_codex_npm_pair(destination,arch):
-    package='@openai/codex-darwin-'+('x64' if arch=='x86_64' else 'arm64')
-    url='https://registry.npmjs.org/'+urllib.parse.quote(package,safe='@/')+'/latest'
-    emit('[工具] 官方发布包未包含完整工具，正在下载官方 npm 平台包 '+package+'。')
+    platform='darwin-'+('x64' if arch=='x86_64' else 'arm64')
+    alias='@openai/codex-'+platform
+    root='https://registry.npmjs.org/@openai%2fcodex/'
+    emit('[工具] 正在获取官方 Codex '+platform+' 平台包。')
     try:
-        req=urllib.request.Request(url,headers={'User-Agent':'Dillo-Codex-Experiment'})
-        with heartbeat('获取 Codex 官方组件信息'),urllib.request.urlopen(req,timeout=60) as response:meta=json.load(response)
+        req=urllib.request.Request(root+'latest',headers={'User-Agent':'Dillo-Codex-Experiment'})
+        with heartbeat('获取 Codex 官方组件信息'),urllib.request.urlopen(req,timeout=60) as response:latest=json.load(response)
+        reference=latest.get('optionalDependencies',{}).get(alias,'')
+        match=re.fullmatch(r'npm:@openai/codex@([0-9A-Za-z.+-]+)',reference)
+        if not match or not match.group(1).endswith('-'+platform):raise ExperimentError('官方 Codex 元数据没有当前平台对应的版本别名。')
+        version=match.group(1)
+        with heartbeat('获取平台版本信息'),urllib.request.urlopen(root+urllib.parse.quote(version,safe=''),timeout=60) as response:meta=json.load(response)
+        if meta.get('name')!='@openai/codex' or meta.get('version')!=version:raise ExperimentError('Codex 平台包版本信息不匹配。')
         tarurl=meta.get('dist',{}).get('tarball','')
         parsed=urllib.parse.urlparse(tarurl)
         if parsed.scheme!='https' or parsed.hostname!='registry.npmjs.org':raise ExperimentError('Codex npm 包地址异常。')
@@ -199,31 +212,10 @@ def ensure_codex(cache,env,log):
         machine=os.uname().machine.lower()
         arch={'arm64':'aarch64','aarch64':'aarch64','x86_64':'x86_64'}.get(machine)
         if not arch: raise ExperimentError('不支持的 Mac 处理器：'+machine)
-        asset=f'codex-{arch}-apple-darwin.tar.gz'
-        url='https://github.com/openai/codex/releases/latest/download/'+asset
-        emit('[工具] 正在从 Codex 官方 GitHub Releases 下载 '+asset)
         mkdir(target.parent)
         with tempfile.TemporaryDirectory(dir=target.parent,prefix='.download-') as td:
-            archive=pathlib.Path(td)/asset
-            for attempt in range(1,4):
-                try:
-                    req=urllib.request.Request(url,headers={'User-Agent':'Dillo-Codex-Experiment'})
-                    with heartbeat('正在下载 Codex'),urllib.request.urlopen(req,timeout=60) as resp, archive.open('wb') as f:
-                        total=0; last=time.monotonic()
-                        while True:
-                            part=resp.read(1024*1024)
-                            if not part: break
-                            total+=len(part)
-                            if total>300*1024*1024: raise ExperimentError('Codex 下载超过预期大小。')
-                            f.write(part)
-                            if time.monotonic()-last>=10: emit(f'[下载] Codex 已下载 {total/1024/1024:.1f} MiB。');last=time.monotonic()
-                    break
-                except (OSError,urllib.error.URLError) as exc:
-                    emit(f'[下载] 第 {attempt} 次失败：{redacted(exc)}')
-                    if attempt==3: raise ExperimentError('Codex 自动下载失败，请检查网络后重新运行。')
-                    time.sleep(attempt*2)
             stage=pathlib.Path(td)
-            if not extract_codex_pair(archive,stage,f'codex-{arch}-apple-darwin'):fetch_codex_npm_pair(stage,arch)
+            fetch_codex_npm_pair(stage,arch)
             if not usable_codex(stage/'codex'): raise ExperimentError('下载的 Codex 无法执行或不支持独立进程。')
             os.replace(stage/'codex-code-mode-host',target.parent/'codex-code-mode-host')
             os.replace(stage/'codex',target)
@@ -1126,10 +1118,11 @@ def agent_main(argv):
     return bus_client(args.control,args.action,args)
 
 def main():
+    global PREPARATION_LOG
     base=pathlib.Path.home()/'codex-agent-experiments';mkdir(base)
     runid='browser01-'+dt.datetime.now().strftime('%Y%m%d-%H%M%S')+'-'+secrets.token_hex(3)
     root=mkdir(base/runid);root.chmod(0o700);mkdir(root/'记录');mkdir(root/'测试')
-    cache=mkdir(base/'工具缓存');log=root/'准备过程.log'
+    cache=mkdir(base/'工具缓存');log=root/'准备过程.log';PREPARATION_LOG=log
     info={'status':'未完成','detail':'准备尚未开始','run_id':runid,'application':'Dillo','app_commit':APP_REV,'started_utc':stamp(),'architecture':'独立 Codex CLI 进程 + 实验 Leader 路由','checks':{}}
     state=None;server=None;sampler=None;code=1;formal=False
     try:

@@ -173,14 +173,19 @@ class DilloStandaloneTest(unittest.TestCase):
    for name,content in [('package/vendor/x86_64-apple-darwin/codex/codex',b'cli'),('package/vendor/x86_64-apple-darwin/codex/codex-code-mode-host',b'host')]:
     entry=tarfile.TarInfo(name);entry.size=len(content);tf.addfile(entry,io.BytesIO(content))
   payload=data.getvalue();integrity='sha512-'+base64.b64encode(hashlib.sha512(payload).digest()).decode()
-  metadata=json.dumps({'version':'test','dist':{'tarball':'https://registry.npmjs.org/a.tgz','integrity':integrity}}).encode()
-  with mock.patch.object(mod.urllib.request,'urlopen',side_effect=[io.BytesIO(metadata),io.BytesIO(payload)]):
+  latest=json.dumps({'optionalDependencies':{'@openai/codex-darwin-x64':'npm:@openai/codex@0.169.0-darwin-x64'}}).encode()
+  metadata=json.dumps({'name':'@openai/codex','version':'0.169.0-darwin-x64','dist':{'tarball':'https://registry.npmjs.org/a.tgz','integrity':integrity}}).encode()
+  with mock.patch.object(mod.urllib.request,'urlopen',side_effect=[io.BytesIO(latest),io.BytesIO(metadata),io.BytesIO(payload)]):
    mod.fetch_codex_npm_pair(self.root,'x86_64')
   self.assertEqual((self.root/'codex').read_bytes(),b'cli');self.assertEqual((self.root/'codex-code-mode-host').read_bytes(),b'host')
   self.assertTrue(os.access(self.root/'codex-code-mode-host',os.X_OK))
-  bad=json.dumps({'dist':{'tarball':'https://registry.npmjs.org/a.tgz','integrity':'sha512-invalid'}}).encode()
-  with mock.patch.object(mod.urllib.request,'urlopen',side_effect=[io.BytesIO(bad),io.BytesIO(payload)]):
+  bad=json.dumps({'name':'@openai/codex','version':'0.169.0-darwin-x64','dist':{'tarball':'https://registry.npmjs.org/a.tgz','integrity':'sha512-invalid'}}).encode()
+  with mock.patch.object(mod.urllib.request,'urlopen',side_effect=[io.BytesIO(latest),io.BytesIO(bad),io.BytesIO(payload)]):
    with self.assertRaises(mod.ExperimentError):mod.fetch_codex_npm_pair(self.root,'x86_64')
+ def test_preparation_log_records_errors_without_secrets(self):
+  path=self.root/'准备过程.log'
+  with mock.patch.object(mod,'PREPARATION_LOG',path):mod.emit('[失败] token=abc123secret')
+  self.assertIn('[失败]',path.read_text());self.assertNotIn('abc123secret',path.read_text())
  def test_invalid_api_key_uses_isolated_login_for_retry(self):
   self.fake.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys
