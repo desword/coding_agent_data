@@ -23,7 +23,7 @@ fi
 exec python3 "$0" "$@"
 ':'''
 from __future__ import annotations
-import argparse, collections, contextlib, csv, datetime as dt, fcntl, html, http.server, json, math, os, pathlib, platform, re, secrets, selectors, shlex, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
+import argparse, base64, collections, contextlib, csv, datetime as dt, fcntl, hashlib, html, http.server, json, math, os, pathlib, platform, re, secrets, selectors, shlex, shutil, signal, socket, statistics, subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
 
 APP_URL='https://github.com/dillo-browser/dillo.git'
 APP_REV='6856c5016de8cc15d077ec8d785bac1a38b4a813'
@@ -32,8 +32,8 @@ TOPICS=('download/contract','download/parser','download/security','download/inte
 WRITE_PATHS={'W1':('src/misc.h','dlib/'),'W2':('test/unit/disposition.c',),'W3':('test/unit/disposition_security.c',),'W4':('test/unit/disposition_http_test.py',),'leader':('src/misc.h','dlib/','test/unit/disposition.c','test/unit/disposition_security.c','test/unit/disposition_http_test.py')}
 TIMEOUT=7200
 MAX_MESSAGE=262144
-# Use the standard shell tool; standalone releases may lack the code-mode host.
-SHELL_FLAGS=['--disable','code_mode','--disable','code_mode_only','--enable','shell_tool']
+# Keep normal Codex tool selection; the host is installed alongside the CLI.
+SHELL_FLAGS=[]
 
 class ExperimentError(Exception): pass
 
@@ -145,12 +145,56 @@ def usable_codex(binary):
         return p.returncode==0 and '--no-daemon' in p.stdout
     except (OSError,subprocess.SubprocessError): return False
 
+def extract_codex_pair(archive, destination, main_name):
+    """Extract both executables from the same official package; never extract paths."""
+    with tarfile.open(archive,'r:gz') as tf:
+        members=[m for m in tf.getmembers() if m.isfile()]
+        mains=[m for m in members if pathlib.PurePosixPath(m.name).name==main_name]
+        for main in mains:
+            folder=pathlib.PurePosixPath(main.name).parent
+            hosts=[m for m in members if pathlib.PurePosixPath(m.name).parent==folder and pathlib.PurePosixPath(m.name).name=='codex-code-mode-host']
+            if len(hosts)!=1:continue
+            for member,name in ((main,'codex'),(hosts[0],'codex-code-mode-host')):
+                if member.size<=0 or member.size>300*1024*1024:raise ExperimentError('Codex 组件大小异常。')
+                dest=destination/name
+                with tf.extractfile(member) as src,dest.open('wb') as out:shutil.copyfileobj(src,out)
+                dest.chmod(0o755)
+            return True
+    return False
+
+def fetch_codex_npm_pair(destination,arch):
+    package='@openai/codex-darwin-'+('x64' if arch=='x86_64' else 'arm64')
+    url='https://registry.npmjs.org/'+urllib.parse.quote(package,safe='@/')+'/latest'
+    emit('[工具] 官方发布包未包含完整工具，正在下载官方 npm 平台包 '+package+'。')
+    try:
+        req=urllib.request.Request(url,headers={'User-Agent':'Dillo-Codex-Experiment'})
+        with heartbeat('获取 Codex 官方组件信息'),urllib.request.urlopen(req,timeout=60) as response:meta=json.load(response)
+        tarurl=meta.get('dist',{}).get('tarball','')
+        parsed=urllib.parse.urlparse(tarurl)
+        if parsed.scheme!='https' or parsed.hostname!='registry.npmjs.org':raise ExperimentError('Codex npm 包地址异常。')
+        archive=destination/'npm-package.tgz'
+        with heartbeat('下载完整 Codex 组件'),urllib.request.urlopen(tarurl,timeout=60) as response,archive.open('wb') as out:
+            total=0;digest=hashlib.sha512()
+            while True:
+                part=response.read(1024*1024)
+                if not part:break
+                total+=len(part)
+                if total>300*1024*1024:raise ExperimentError('Codex npm 包超过预期大小。')
+                digest.update(part);out.write(part)
+        integrity=meta.get('dist',{}).get('integrity','')
+        expected='sha512-'+base64.b64encode(digest.digest()).decode('ascii')
+        if expected not in integrity.split():raise ExperimentError('Codex npm 包完整性校验失败。')
+        if not extract_codex_pair(archive,destination,'codex'):raise ExperimentError('官方 npm 平台包没有同目录的 Codex 和 code-mode host；请查看准备过程日志。')
+        archive.unlink()
+        emit('[工具] 已取得同一官方版本的 Codex 与工具宿主：'+str(meta.get('version','未知')))
+    except (OSError,ValueError,urllib.error.URLError,tarfile.TarError) as exc:raise ExperimentError('自动获取完整 Codex 组件失败：'+redacted(exc)) from exc
+
 def ensure_codex(cache,env,log):
     system=shutil.which('codex',path=env.get('PATH'))
     if system and usable_codex(system): emit('[工具] 使用现有 Codex：'+system); return system
     target=cache/'codex独立版'/'codex'
     with cache_lock(cache):
-        if target.exists() and usable_codex(target): emit('[缓存] 复用 Codex。'); return str(target)
+        if target.exists() and (target.parent/'codex-code-mode-host').is_file() and os.access(target.parent/'codex-code-mode-host',os.X_OK) and usable_codex(target): emit('[缓存] 复用完整 Codex 和工具宿主。'); return str(target)
         if sys.platform!='darwin': raise ExperimentError('需要支持 --no-daemon 的 Codex CLI；本机自动下载仅支持 macOS。')
         machine=os.uname().machine.lower()
         arch={'arm64':'aarch64','aarch64':'aarch64','x86_64':'x86_64'}.get(machine)
@@ -178,14 +222,11 @@ def ensure_codex(cache,env,log):
                     emit(f'[下载] 第 {attempt} 次失败：{redacted(exc)}')
                     if attempt==3: raise ExperimentError('Codex 自动下载失败，请检查网络后重新运行。')
                     time.sleep(attempt*2)
-            with tarfile.open(archive,'r:gz') as tf:
-                choices=[m for m in tf.getmembers() if m.isfile() and pathlib.PurePosixPath(m.name).name==f'codex-{arch}-apple-darwin']
-                if len(choices)!=1 or choices[0].size>300*1024*1024: raise ExperimentError('Codex 官方压缩包格式异常。')
-                stage=pathlib.Path(td)/'codex'
-                with tf.extractfile(choices[0]) as src, stage.open('wb') as dest: shutil.copyfileobj(src,dest)
-                stage.chmod(0o755)
-                if not usable_codex(stage): raise ExperimentError('下载的 Codex 无法执行或不支持独立进程。')
-                os.replace(stage,target)
+            stage=pathlib.Path(td)
+            if not extract_codex_pair(archive,stage,f'codex-{arch}-apple-darwin'):fetch_codex_npm_pair(stage,arch)
+            if not usable_codex(stage/'codex'): raise ExperimentError('下载的 Codex 无法执行或不支持独立进程。')
+            os.replace(stage/'codex-code-mode-host',target.parent/'codex-code-mode-host')
+            os.replace(stage/'codex',target)
         return str(target)
 
 def model_error(path):
@@ -1039,14 +1080,7 @@ def probe_shell(state):
     try:valid=marker.read_text(encoding='utf-8')==token
     except OSError:valid=False
     finally:marker.unlink(missing_ok=True)
-    command_seen=False
-    for line in out.read_text(encoding='utf-8',errors='replace').splitlines():
-        try:event=json.loads(line)
-        except ValueError:continue
-        if not isinstance(event,dict):continue
-        item=event.get('item') or {}
-        if isinstance(item,dict) and event.get('type')=='item.completed' and item.get('type')=='command_execution' and item.get('exit_code')==0:command_seen=True
-    if p.returncode or not valid or not command_seen:
+    if p.returncode or not valid:
         detail=model_error(out) or redacted(err.read_text(encoding='utf-8',errors='replace')[-1200:])
         raise ExperimentError('Codex 未通过实际 shell 执行检查；请查看记录/工具执行检查.jsonl 和 .log。'+detail)
     emit('[工具] Codex shell 实际执行检查通过。')

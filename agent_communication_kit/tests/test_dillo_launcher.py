@@ -1,4 +1,4 @@
-import csv, importlib.machinery, importlib.util, json, os, pathlib, subprocess, sys, tempfile, threading, time, unittest, urllib.error, urllib.request
+import base64, csv, hashlib, importlib.machinery, importlib.util, io, json, os, pathlib, subprocess, sys, tarfile, tempfile, threading, time, unittest, urllib.error, urllib.request
 from unittest import mock
 
 REPO=pathlib.Path(__file__).resolve().parents[2]
@@ -167,6 +167,20 @@ class DilloStandaloneTest(unittest.TestCase):
   self.assertFalse((self.repos['leader']/'.experiment-build/shell-preflight.txt').exists())
   self.fake.write_text('#!/usr/bin/env python3\nprint(\'{"type":"turn.completed"}\')\n');self.fake.chmod(0o755)
   with self.assertRaises(mod.ExperimentError):mod.probe_shell(self.state)
+ def test_official_npm_pair_and_integrity(self):
+  data=io.BytesIO()
+  with tarfile.open(fileobj=data,mode='w:gz') as tf:
+   for name,content in [('package/vendor/x86_64-apple-darwin/codex/codex',b'cli'),('package/vendor/x86_64-apple-darwin/codex/codex-code-mode-host',b'host')]:
+    entry=tarfile.TarInfo(name);entry.size=len(content);tf.addfile(entry,io.BytesIO(content))
+  payload=data.getvalue();integrity='sha512-'+base64.b64encode(hashlib.sha512(payload).digest()).decode()
+  metadata=json.dumps({'version':'test','dist':{'tarball':'https://registry.npmjs.org/a.tgz','integrity':integrity}}).encode()
+  with mock.patch.object(mod.urllib.request,'urlopen',side_effect=[io.BytesIO(metadata),io.BytesIO(payload)]):
+   mod.fetch_codex_npm_pair(self.root,'x86_64')
+  self.assertEqual((self.root/'codex').read_bytes(),b'cli');self.assertEqual((self.root/'codex-code-mode-host').read_bytes(),b'host')
+  self.assertTrue(os.access(self.root/'codex-code-mode-host',os.X_OK))
+  bad=json.dumps({'dist':{'tarball':'https://registry.npmjs.org/a.tgz','integrity':'sha512-invalid'}}).encode()
+  with mock.patch.object(mod.urllib.request,'urlopen',side_effect=[io.BytesIO(bad),io.BytesIO(payload)]):
+   with self.assertRaises(mod.ExperimentError):mod.fetch_codex_npm_pair(self.root,'x86_64')
  def test_invalid_api_key_uses_isolated_login_for_retry(self):
   self.fake.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys
