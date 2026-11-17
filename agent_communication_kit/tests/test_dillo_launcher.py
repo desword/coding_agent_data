@@ -153,6 +153,11 @@ class DilloStandaloneTest(unittest.TestCase):
   path=self.root/'记录/model-error.jsonl'
   path.write_text(json.dumps({'type':'item.completed','item':{'type':'error','message':'model_not_found token=abc123secret'}})+'\n')
   message=mod.model_error(path);self.assertIn('model_not_found',message);self.assertNotIn('abc123secret',message)
+ def test_no_worker_diagnostic_surfaces_leader_message_and_redacts_secret(self):
+  path=self.root/'记录/leader-events.jsonl'
+  path.write_text(json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'无法执行工具 token=abc123secret'}})+'\n')
+  result=mod.leader_diagnostics(self.root/'记录')
+  self.assertIn('无法执行工具',result);self.assertNotIn('abc123secret',result)
  def test_invalid_api_key_uses_isolated_login_for_retry(self):
   self.fake.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys

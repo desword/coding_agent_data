@@ -199,6 +199,27 @@ def model_error(path):
                 errors.append(redacted(detail))
     return ' | '.join(errors[-3:])
 
+def leader_diagnostics(raw):
+    """Expose actual final replies and failed tool results when no Worker starts."""
+    findings=[];path=raw/'leader-events.jsonl'
+    if path.exists():
+        for line in path.read_text(encoding='utf-8',errors='replace').splitlines():
+            try:event=json.loads(line)
+            except (ValueError,UnicodeError):continue
+            if not isinstance(event,dict):continue
+            item=event.get('item') or {}
+            if not isinstance(item,dict):continue
+            kind=item.get('type','')
+            if kind=='agent_message' and event.get('type')=='item.completed':
+                findings.append('Leader 回复：'+redacted(item.get('text','')))
+            elif kind=='command_execution' and event.get('type') in ('item.completed','item.failed') and (event.get('type')=='item.failed' or item.get('exit_code') not in (None,0)):
+                findings.append('命令失败：'+redacted(item.get('aggregated_output') or item.get('command') or item))
+    err=raw/'leader-stderr.log'
+    if err.exists():
+        tail=redacted(err.read_text(encoding='utf-8',errors='replace')[-2000:])
+        if tail:findings.append('Leader stderr：'+tail)
+    return ' | '.join(findings[-3:])[-3000:] or '未找到可识别的 Leader 回复或命令错误；请查看记录/leader-events.jsonl 和 leader-stderr.log。'
+
 def available_models(codex):
     process=None; selector=None
     try:
@@ -1111,6 +1132,10 @@ def main():
         info['validation_seconds']=round(time.monotonic()-verification_start,3)
         state.end_ns=time.monotonic_ns()
         success,detail=completion_result(state,info['checks'])
+        if not any(role in state.procs for role in ROLES):
+            diagnostic=leader_diagnostics(state.raw)
+            detail='Leader 未启动 Worker。'+diagnostic+'；'+detail
+            emit('[诊断] '+diagnostic)
         if success:
             info['status']='核心开发与独立验证完成';info['detail']='已运行独立 Codex 进程和本机中继；完整浏览器 GUI 未验证。';code=0
         else:
