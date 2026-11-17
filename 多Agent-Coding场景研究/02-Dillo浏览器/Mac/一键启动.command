@@ -266,10 +266,27 @@ def check_auth(codex,app,logs):
     ok,message=probe(None,1)
     if ok:emit('[登录] 默认模型连接成功。');return None
     text=message.lower()
+    if 'invalid_api_key' in text or 'incorrect api key' in text:
+        home=mkdir(logs.parent.parent/'工具缓存'/'Dillo-Codex登录');home.chmod(0o700)
+        emit('[登录] 当前 API Key 无效。将使用实验专用登录目录，请按 Codex 官方提示完成浏览器登录；原有账号配置不会被修改。')
+        os.environ['CODEX_HOME']=str(home)
+        os.environ.pop('OPENAI_API_KEY',None);os.environ.pop('CODEX_API_KEY',None)
+        cached=subprocess.run([codex,'login','status'],capture_output=True,text=True,timeout=30)
+        if cached.returncode==0:
+            ok,message=probe(None,2)
+            if ok:emit('[登录] 已复用实验专用登录。');return None
+        emit('[登录] 请在浏览器或终端完成 Codex 官方认证。')
+        result=subprocess.run([codex,'login'])
+        if result.returncode:raise ExperimentError('实验专用 Codex 登录未完成，请重新双击并完成浏览器认证。')
+        ok,message=probe(None,2)
+        if ok:emit('[登录] 实验专用登录与默认模型连接成功。');return None
+        text=message.lower()
+        if 'invalid_api_key' in text or 'incorrect api key' in text:
+            raise ExperimentError('实验专用登录仍返回无效 API Key；请重新运行并使用有效的官方登录方式。'+message)
     if 'model_not_found' not in text and not ('model' in text and ('not supported' in text or 'not available' in text)):
         raise ExperimentError('Codex 模型连接失败：'+message)
     emit('[模型] 默认模型不可用，正在从 Codex 获取可选模型并逐个验证。')
-    for index,model in enumerate(available_models(codex)[:4],2):
+    for index,model in enumerate(available_models(codex)[:4],3):
         ok,message=probe(model,index)
         if ok:emit('[模型] 使用已验证模型 '+model);return model
         if 'model_not_found' not in message.lower() and 'not supported' not in message.lower() and 'not available' not in message.lower():break
@@ -1041,6 +1058,9 @@ def main():
         info['baseline_cases']=baseline(repos['leader'],cc,log)
         emit('\n【准备 4/4：Codex 登录与模型连接】')
         selected_model=check_auth(codex,repos['leader'],root/'记录');info['model_selection']=selected_model or 'Codex 默认模型'
+        for key in ('CODEX_HOME','OPENAI_API_KEY','CODEX_API_KEY'):
+            if key in os.environ:env[key]=os.environ[key]
+            else:env.pop(key,None)
         env['RUST_LOG']=env.get('RUST_LOG','warn')+',codex_otel=info'
         state=State(root,repos,codex,env,None,cc);state.model=selected_model
         server=serve(state)

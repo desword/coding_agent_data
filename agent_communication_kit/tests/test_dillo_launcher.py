@@ -153,6 +153,23 @@ class DilloStandaloneTest(unittest.TestCase):
   path=self.root/'记录/model-error.jsonl'
   path.write_text(json.dumps({'type':'item.completed','item':{'type':'error','message':'model_not_found token=abc123secret'}})+'\n')
   message=mod.model_error(path);self.assertIn('model_not_found',message);self.assertNotIn('abc123secret',message)
+ def test_invalid_api_key_uses_isolated_login_for_retry(self):
+  self.fake.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+home=os.environ.get("CODEX_HOME", "")
+if sys.argv[1:]==["login", "status"]:
+ raise SystemExit(0 if not home or (pathlib.Path(home)/"logged-in").exists() else 1)
+if sys.argv[1:]==["login"]:
+ pathlib.Path(home, "logged-in").touch();raise SystemExit(0)
+if not home or os.environ.get("OPENAI_API_KEY"):
+ print(json.dumps({"type":"turn.failed","error":{"message":"invalid_api_key Incorrect API key"}}));raise SystemExit(1)
+print(json.dumps({"type":"turn.completed"}))
+''');self.fake.chmod(0o755)
+  with mock.patch.dict(os.environ,{'OPENAI_API_KEY':'invalid-fixture'},clear=False):
+   os.environ.pop('CODEX_HOME',None)
+   self.assertIsNone(mod.check_auth(str(self.fake),self.repos['leader'],self.root/'记录'))
+   self.assertNotIn('OPENAI_API_KEY',os.environ)
+   self.assertTrue(pathlib.Path(os.environ['CODEX_HOME'],'logged-in').exists())
 
 class DilloCheckoutTest(unittest.TestCase):
  def test_first_fetch_and_cached_clones(self):
